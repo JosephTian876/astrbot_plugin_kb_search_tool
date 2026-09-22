@@ -1,0 +1,32 @@
+name: astrbot_plugin_kb_search_tool
+display_name: 知识库检索常驻
+desc: 让 astr_kb_search 工具始终可用，同时保留知识库自动注入 —— 核心的 kb_agentic_mode 二选一做不到。
+description: |
+  让内置的知识库检索工具 `astr_kb_search` 常驻到每次 LLM 请求。
+
+  解决的问题
+  ----------
+  AstrBot 核心的 `astr_main_agent._apply_kb()` 是 if/else 二选一：
+
+  - `kb_agentic_mode=false`：有文字时自动注入知识库结果，但模型手上**没有**
+    查知识库的工具；纯附件消息（如只发视频）更是直接跳过检索。
+  - `kb_agentic_mode=true`：模型有了工具，但**失去自动注入**。
+
+  本插件在 `on_llm_request` 阶段直接把 `astr_kb_search` 塞进 `req.func_tool`，
+  不碰 `kb_agentic_mode` —— 两者兼得。
+
+  为什么这很重要
+  --------------
+  若 persona 里写了「先查知识库再回答」，而模型又没有知识库工具，它会**把
+  「查知识库」理解成「搜磁盘」**，用代码执行工具扫遍全盘。实测某部署因此
+  跑满 30 步工具调用、耗时 12 分钟才回复，且连续复现三次。
+
+  装了本插件后，模型说「查知识库」时有真正的工具可用，不必碰文件系统。
+version: 0.1.0
+author: JosephTian876
+repo: https://github.com/JosephTian876/astrbot_plugin_kb_search_tool
+category: AI 增强
+tags:
+  - 知识库
+  - 工具
+  - AI 增强

@@ -1,0 +1,14 @@
+{
+  "enable": {
+    "description": "启用知识库检索常驻",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后插件完全不介入请求，模型是否有 astr_kb_search 取决于核心的 kb_agentic_mode。"
+  },
+  "only_when_kb_configured": {
+    "description": "仅在已配置知识库时注入",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，若 kb_names 为空则不注入工具，避免给模型一个查不到东西的工具。若你的知识库是通过其他方式（插件/会话级）配置的，可关闭此项强制注入。"
+  }
+}

@@ -1,0 +1,7 @@
+# astrbot_plugin_kb_search_tool
+#
+# 本插件不引入任何第三方 Python 依赖。
+#
+# 说明：它复用 AstrBot 内置的 astr_kb_search 工具（astrbot.core.tools.
+# knowledge_base_tools.KnowledgeBaseQueryTool），因此 astrbot 本体已依赖的
+# 包无需在此重复声明，以免版本冲突。
