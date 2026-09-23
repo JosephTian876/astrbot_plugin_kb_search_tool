@@ -51,8 +51,24 @@ except Exception:  # pragma: no cover - 版本差异兜底
     ToolSet = None  # type: ignore[assignment]
 
 PLUGIN_NAME = "astrbot_plugin_kb_search_tool"
-PLUGIN_VERSION = "0.1.0"
 PLUGIN_REPO = "https://github.com/JosephTian876/astrbot_plugin_kb_search_tool"
+
+
+def _read_plugin_version() -> str:
+    """从 metadata.yaml 读取版本号，避免与发布版本脱节。"""
+    try:
+        from pathlib import Path
+
+        text = (Path(__file__).parent / "metadata.yaml").read_text(encoding="utf-8")
+        for line in text.splitlines():
+            if line.startswith("version:"):
+                return line.split(":", 1)[1].strip().strip("\"'")
+    except Exception:  # noqa: BLE001 - 读不到就用占位值，不影响功能
+        pass
+    return "unknown"
+
+
+PLUGIN_VERSION = _read_plugin_version()
 
 #: 核心工具名。核心在 agentic 模式下也注册同名工具，本插件复用同一个实例。
 KB_TOOL_NAME = "astr_kb_search"
