@@ -1,11 +1,15 @@
 # 更新日志
 
+## 0.1.2
+
+- 启动日志打印的版本号改为从 `metadata.yaml` 读取，不再硬编码，避免与发布版本脱节
+
 ## 0.1.1
 
 按插件市场自动安全检查（LLM Guard）意见修复日志规范。**无功能变更。**
 
-- 移除 `main.py` 中 `except ImportError` 回退到 Python 内置 `logging` 模块的分支，
-  直接使用 `astrbot.api` 的 logger
+- `main.py`：移除导入失败时回退到 Python 内置日志模块的分支，直接使用 `astrbot.api`
+  的 logger
 
 规范要求日志记录器**必须且只能**从 `astrbot.api` 导入。本插件声明支持
 AstrBot >= 4.23，该版本已提供 `astrbot.api.logger`，回退分支本就不必要。
