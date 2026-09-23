@@ -25,6 +25,9 @@ description: |
 version: 0.1.0
 author: JosephTian876
 repo: https://github.com/JosephTian876/astrbot_plugin_kb_search_tool
+short_desc: 让 astr_kb_search 工具始终可用
+astrbot_version: ">=4.23,<5"
+social_link: https://github.com/JosephTian876
 category: AI 增强
 tags:
   - 知识库
