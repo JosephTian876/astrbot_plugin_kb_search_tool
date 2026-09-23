@@ -41,15 +41,9 @@ else:
 
 from __future__ import annotations
 
+from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
-
-try:
-    from astrbot.api import logger
-except ImportError:  # pragma: no cover
-    import logging
-
-    logger = logging.getLogger(__name__)
 
 try:
     from astrbot.core.agent.tool import ToolSet
