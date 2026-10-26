@@ -70,13 +70,6 @@ class FakeContext:
         return {"kb_names": list(self.kb_names)}
 
 
-class FakeRequest:
-    """``ProviderRequest`` 的替身：本插件只读写 ``func_tool`` 这一个字段。"""
-
-    def __init__(self, func_tool=None) -> None:
-        self.func_tool = func_tool
-
-
 def make_plugin(
     plugin_module,
     *,
@@ -104,7 +97,7 @@ def test_01_injects_the_core_builtin_instance(
     """有知识库 → 注入，且注入的就是核心缓存的那个实例；成功注入留一条 DEBUG。"""
     plugin, manager, context, tool = make_plugin(plugin_module, kb_names=["kb1"])
 
-    req = FakeRequest()
+    req = stub.ProviderRequest()
     hook(plugin, req)
 
     assert req.func_tool is not None
@@ -131,7 +124,7 @@ def test_02_no_kb_skips_injection_and_warns_exactly_once(plugin_module, hook, lo
     plugin, _, context, _ = make_plugin(plugin_module, kb_names=[])
 
     for _ in range(3):
-        req = FakeRequest()
+        req = stub.ProviderRequest()
         hook(plugin, req)
         assert req.func_tool is None
 
@@ -148,7 +141,7 @@ def test_03_session_level_kb_ids_inject_even_if_global_kb_names_empty(
     sp.session[("aiocqhttp:FriendMessage:10086", "kb_config")] = {"kb_ids": [7]}
     plugin, _, context, tool = make_plugin(plugin_module, kb_names=[])
 
-    req = FakeRequest()
+    req = stub.ProviderRequest()
     hook(plugin, req)
 
     assert req.func_tool is not None
@@ -163,7 +156,7 @@ def test_04_session_level_kb_ids_empty_disables_injection(plugin_module, hook, s
     sp.session[("aiocqhttp:FriendMessage:10086", "kb_config")] = {"kb_ids": []}
     plugin, _, _, _ = make_plugin(plugin_module, kb_names=["kb1"])
 
-    req = FakeRequest()
+    req = stub.ProviderRequest()
     hook(plugin, req)
 
     assert req.func_tool is None
@@ -175,7 +168,7 @@ def test_05_disabled_plugin_does_not_touch_the_request(plugin_module, hook, logs
         plugin_module, config={"enable": False}, kb_names=["kb1"]
     )
 
-    req = FakeRequest()
+    req = stub.ProviderRequest()
     hook(plugin, req)
 
     assert req.func_tool is None
@@ -189,7 +182,7 @@ def test_06_creates_a_tool_set_when_request_has_none(plugin_module, hook):
     """``req.func_tool is None``（纯对话没有别的工具）→ 新建 ToolSet 并注入。"""
     plugin, _, _, tool = make_plugin(plugin_module, kb_names=["kb1"])
 
-    req = FakeRequest(func_tool=None)
+    req = stub.ProviderRequest(func_tool=None)
     hook(plugin, req)
 
     assert isinstance(req.func_tool, stub.ToolSet)
@@ -203,7 +196,7 @@ def test_07_existing_same_named_tool_is_not_duplicated_or_replaced(plugin_module
     tool_set = stub.ToolSet()
     tool_set.add_tool(existing)
 
-    req = FakeRequest(func_tool=tool_set)
+    req = stub.ProviderRequest(func_tool=tool_set)
     hook(plugin, req)
 
     assert [t.name for t in req.func_tool.tools] == [plugin_module.KB_TOOL_NAME]
@@ -225,14 +218,14 @@ def test_08_resolve_failure_is_contained_then_self_heals(plugin_module, hook, lo
     assert logs[-1].levelno == logging.ERROR, "故障时最后一条日志应是 ERROR"
 
     # 运行期仍取不到：不抛、不刷屏、不注入。
-    req = FakeRequest()
+    req = stub.ProviderRequest()
     hook(plugin, req)
     assert req.func_tool is None
     assert len(messages(logs, logging.ERROR)) == 1
 
     # 工具恢复 → 下一个请求自动注入，不需要重载插件。
     manager.raises = None
-    req = FakeRequest()
+    req = stub.ProviderRequest()
     hook(plugin, req)
     assert req.func_tool is not None
     assert req.func_tool.get_tool(plugin_module.KB_TOOL_NAME) is tool
@@ -247,7 +240,7 @@ def test_09_injection_exception_does_not_escape_the_hook(plugin_module, hook, lo
 
     plugin, _, _, _ = make_plugin(plugin_module, kb_names=["kb1"])
 
-    req = FakeRequest(func_tool=ExplodingToolSet())
+    req = stub.ProviderRequest(func_tool=ExplodingToolSet())
     hook(plugin, req)  # 不抛即通过
 
     errors = messages(logs, logging.ERROR)
@@ -281,7 +274,7 @@ def test_11_fail_open_when_session_get_raises(plugin_module, hook, sp):
     sp.error = RuntimeError("database is locked")
     plugin, _, _, tool = make_plugin(plugin_module, kb_names=[])
 
-    req = FakeRequest()
+    req = stub.ProviderRequest()
     hook(plugin, req)
 
     assert req.func_tool is not None
@@ -294,7 +287,7 @@ def test_12_fail_open_when_get_config_raises(plugin_module, hook):
         plugin_module, kb_names=[], config_raises=RuntimeError("config is broken")
     )
 
-    req = FakeRequest()
+    req = stub.ProviderRequest()
     hook(plugin, req)
 
     assert req.func_tool is not None

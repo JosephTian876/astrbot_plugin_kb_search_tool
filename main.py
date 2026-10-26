@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from astrbot.api import FunctionTool, ToolSet, logger, sp
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 
 #: 核心内置工具名。``kb_agentic_mode=true`` 时核心注册的是同一个类的同一个实例，
@@ -46,9 +47,11 @@ class KBSearchToolPlugin(Star):
         self._resolve_tool()
 
     @filter.on_llm_request(priority=HOOK_PRIORITY)
-    async def on_llm_request(self, event: AstrMessageEvent, req: object) -> None:
+    async def on_llm_request(
+        self, event: AstrMessageEvent, req: ProviderRequest
+    ) -> None:
         """确保本次请求的工具集中含有 astr_kb_search。"""
-        # req 是核心的 ProviderRequest，但它不在 astrbot.api 公开面里，故只按鸭子类型用；
+        # req 是公开面类型 ProviderRequest（字段定义见 core/provider/entities.py）；
         # 这里必须 fail-open：注入失败最坏只是模型少一个工具，绝不能打断正常对话。
         try:
             await self._ensure_tool(event, req)
@@ -57,7 +60,7 @@ class KBSearchToolPlugin(Star):
                 "[KBTool] 注入工具时异常，已跳过本次注入: %s", exc, exc_info=True
             )
 
-    async def _ensure_tool(self, event: AstrMessageEvent, req: object) -> None:
+    async def _ensure_tool(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
         if not self.enabled:  # 关闭时彻底不介入，痕迹只有启动那行"启用=False"
             return
 
@@ -65,7 +68,7 @@ class KBSearchToolPlugin(Star):
         if tool is None:
             return  # 原因与补救办法已由 _resolve_tool 打过一次
 
-        tool_set = getattr(req, "func_tool", None)
+        tool_set = req.func_tool
         if tool_set is not None and tool_set.get_tool(KB_TOOL_NAME) is not None:
             # 核心 agentic 模式或别的钩子已加过：不重复添加，也不替换别人的实例。
             return
@@ -80,7 +83,7 @@ class KBSearchToolPlugin(Star):
             return
 
         if tool_set is None:  # 纯对话没有别的工具时核心给的就是 None，不新建等于缺席
-            req.func_tool = ToolSet()  # type: ignore[attr-defined]
+            req.func_tool = ToolSet()
             tool_set = req.func_tool
         tool_set.add_tool(tool)
         # 日志取值也不假设一定有 ``tools``：func_tool 可能被别的插件换成自定义对象。

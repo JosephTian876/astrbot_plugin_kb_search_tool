@@ -105,6 +105,17 @@ class _SharedPreferences:
 SP = _SharedPreferences()
 
 
+class ProviderRequest:
+    """``astrbot.core.provider.entities.ProviderRequest`` 的最小替身。
+
+    插件只读写 ``func_tool`` 这一个字段；``prompt`` / ``contexts`` 等字段插件不碰，
+    替身就不提供 —— 与其它替身一样，只给插件真正用到的成员。
+    """
+
+    def __init__(self, func_tool: ToolSet | None = None) -> None:
+        self.func_tool = func_tool
+
+
 class AstrMessageEvent:
     """``AstrMessageEvent`` 的最小替身：插件只读 ``unified_msg_origin``。"""
 
@@ -161,6 +172,10 @@ def install() -> None:
     event.AstrMessageEvent = AstrMessageEvent
     event.filter = FILTER
 
+    provider = types.ModuleType("astrbot.api.provider")
+    provider.__all__ = ["ProviderRequest"]
+    provider.ProviderRequest = ProviderRequest
+
     star = types.ModuleType("astrbot.api.star")
     star.Context = Context
     star.Star = Star
@@ -171,6 +186,7 @@ def install() -> None:
     pkg.api = api
 
     api.event = event
+    api.provider = provider
     api.star = star
 
     sys.modules.update(
@@ -178,6 +194,7 @@ def install() -> None:
             "astrbot": pkg,
             "astrbot.api": api,
             "astrbot.api.event": event,
+            "astrbot.api.provider": provider,
             "astrbot.api.star": star,
         }
     )
