@@ -12,8 +12,9 @@
 - **走内置 Agent**：`agent_runner.runner_type = local`。核心的知识库逻辑（自动注入与
   `kb_agentic_mode` 开关）只属于内置 Agent；Dify / Coze 等第三方 Agent 运行器不读它。
 - **当前 provider 支持函数调用（tool use）**：核心自己的配置项也写着这个前提——
-  「Agentic 知识库检索……需要模型支持函数调用能力」。4.28 起，provider 的「模型能力」
-  若没勾选「工具使用」（`tool_use`），全部工具都会被核心丢弃。
+  「Agentic 知识库检索……需要模型支持函数调用能力」。而且 4.23.5 起，provider 的
+  「模型能力」里若没勾选「工具使用」（`tool_use`），核心会把本次请求的全部工具丢弃
+  （连本插件注入的这个也丢）。
 - **AstrBot >= 4.23**：`FunctionToolManager.get_builtin_tool()` 自该版本起才提供。
 
 ## 2. 解决的问题
@@ -109,9 +110,9 @@ persona 里也不要再把知识库描述成目录树。
 | AstrBot | 结论 |
 |---|---|
 | 4.23.0 | **支持**（声明下界）：`sp` / `ToolSet` / `get_config(umo=)` / `get_builtin_tool()` 均在，已在真实源码树上跑通 |
-| 4.24 – 4.27 | 用到的公开面（`astrbot.api` 的 `ToolSet`/`sp`/`logger`）已逐 tag 核对一致，核心 API 无变化；未做端到端实跑 |
-| 4.28.1 | **支持**，已实测 |
-| 4.29.1 | **支持**（当前生产版本），已实测 |
+| 4.24.5 / 4.25.6 / 4.26.8 / 4.27.5 | 用到的公开面（`astrbot.api` 的 `ToolSet`/`sp`/`logger`）已逐 tag 核对一致，核心 API 无变化；未做端到端实跑 |
+| 4.28.1 | **支持**，已在真实源码树上跑通 |
+| 4.29.1 | **支持**（当前生产版本），已在真实源码树上跑通 |
 
 ## 开发
 
