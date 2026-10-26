@@ -39,7 +39,8 @@ def _load_plugin():
     return module
 
 
-#: 不往仓库里写 ``__pycache__``：测试不该在版本库里留产物。
+#: 让插件模块与测试模块不落 ``.pyc``。注意：``conftest``/``_astrbot_stub`` 这两份由解释器在
+#: 导入期写（本行生效之前），已在 ``.gitignore`` 里忽略 ``__pycache__/``。
 sys.dont_write_bytecode = True
 _astrbot_stub.install()
 PLUGIN = _load_plugin()
