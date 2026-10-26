@@ -12,9 +12,17 @@
 - **走内置 Agent**：`agent_runner.runner_type = local`。核心的知识库逻辑（自动注入与
   `kb_agentic_mode` 开关）只属于内置 Agent；Dify / Coze 等第三方 Agent 运行器不读它。
 - **当前 provider 支持函数调用（tool use）**：核心自己的配置项也写着这个前提——
-  「Agentic 知识库检索……需要模型支持函数调用能力」。而且 4.23.5 起，provider 的
-  「模型能力」里若没勾选「工具使用」（`tool_use`），核心会把本次请求的全部工具丢弃
-  （连本插件注入的这个也丢）。
+  「Agentic 知识库检索……需要模型支持函数调用能力」（`core/config/default.py`）。
+  provider 的「模型能力」没勾「工具使用」（`tool_use`）时核心会清空工具，但清零点变过：
+  - **< 4.23.5（实测 4.23.0 / 4.23.1 / 4.23.2）**：清空在构建期
+    （`core/astr_main_agent.py` 的 `_modalities_fix`；4.23.0 在 `:826` 定义、`:1396` 调用），
+    早于 `on_llm_request`（钩子在 `build_main_agent` 之后触发）—— 本插件随后注入的工具
+    **不会被清掉**，会带着工具发给一个不支持工具调用的 provider（后果取决于 provider SDK，
+    可能直接报错）。
+  - **≥4.23.5**：清空移到 runner（4.29.1：`core/agent/runners/tool_loop_agent_runner.py`
+    的 `_func_tool_for_provider`），在 `reset()` 时执行，晚于钩子（`internal.py` 先
+    触发钩子、再 `await reset_coro`）—— 本插件注入的工具也会被丢掉。
+  所以无论哪个版本，都要给会话用的 provider 勾上「工具使用」。
 - **AstrBot >= 4.23**：`FunctionToolManager.get_builtin_tool()` 自该版本起才提供。
 
 ## 2. 解决的问题
@@ -37,8 +45,9 @@
 
 安装（任选其一）：
 
-- **插件市场**：WebUI → 插件 → 插件市场 → 搜索「知识库检索常驻」→ 安装。
-- **命令行**：
+- **插件市场（若已收录）**：WebUI → 插件 → 插件市场 → 搜索「知识库检索常驻」→ 安装。
+  市场收录有滞后，搜不到就用下面这种方式，它始终可用。
+- **命令行（始终可用）**：
 
   ```bash
   cd <AstrBot>/data/plugins
@@ -56,7 +65,11 @@
 | 键 | 默认 | 说明 |
 |---|---|---|
 | `enable` | `true` | 总开关。关闭后本插件不介入任何请求。 |
-| `only_when_kb_configured` | `true` | 只在「当前会话有可用知识库」时注入。判定顺序与核心检索一致：**会话级知识库设置优先**，主配置 `kb_names` 兜底；两者都没有时不注入。关闭后总是注入。 |
+| `only_when_kb_configured` | `true` | 只在「当前会话或主配置里**配置了非空**的知识库」时注入。判定顺序与核心检索一致：会话级 `kb_config.kb_ids` 优先、主配置 `kb_names` 兜底（`core/tools/knowledge_base_tools.py`）。**不校验知识库是否存在或是否有内容**（那要读核心私有面，本插件不碰），所以 `kb_ids` 指向已删除的知识库时仍会注入，此时工具会返回 `No relevant knowledge found.`。关闭后总是注入。 |
+
+> `kb_agentic_mode=true` 时工具由核心自己添加（`core/astr_main_agent.py` 的 `_apply_kb`
+> 的 else 分支），本插件检测到同名工具已存在就什么都不做 —— 这种配置下上面两个开关都
+> 不改变结果。
 
 ## 5. 如何确认它在工作
 
@@ -75,14 +88,20 @@
      → 核心的内置工具注册表不可用（版本低于 4.23，或某个内置工具模块导入失败）。
      环境修好后下一个请求会自动恢复，不需要重装插件。
    - `[KBTool] 当前会话与主配置都没有可用知识库，已跳过注入工具；...`
-     → 不是故障。要么去配置里选知识库，要么关掉本插件的 `only_when_kb_configured`。
+     → 不是故障。插件只判断"配置是否非空"（不校验知识库是否存在/有内容）：要么去配置里
+     选知识库，要么关掉本插件的 `only_when_kb_configured`。
 4. **行为验证（最可靠）**：在对话里发「用知识库检索工具查一下 XXX」，
    模型这次的工具调用里出现 `astr_kb_search` 即为生效。
 
 ## 6. 适用范围与边界
 
-- **只覆盖内置 Agent 的主对话链路**（`runner_type = local`）。cron 定时任务、后台任务唤醒、
-  第三方 Agent 运行器都不经过 `on_llm_request`，本插件对它们无效。
+- **只覆盖内置 Agent 的主对话链路**（`runner_type = local`）。cron 定时任务与后台任务
+  唤醒**不经过** `on_llm_request`（它们直接调 `build_main_agent`：`core/cron/manager.py`、
+  `core/astr_agent_tool_exec.py`），本插件对它们无效。第三方 Agent 运行器
+  （dify/coze/dashscope/deerflow）**会**触发 `on_llm_request`
+  （`core/pipeline/process_stage/method/agent_sub_stages/third_party.py`），但它们的
+  runner 不读 `req.func_tool`，注入进去没人用 —— 对它们同样无效，真正的原因是
+  "runner 不看工具列表"，不是"钩子不执行"。
 - **在面板里「停用」该内置工具不会阻止注入**：核心的 `get_builtin_tool()` 与工具集序列化
   都不看 `active`，`kb_agentic_mode = true` 的核心路径同理。
 - 知识库检索依赖外部 **embedding / rerank** 服务。网络慢时核心可能触发 120 秒工具超时
@@ -109,7 +128,8 @@ persona 里也不要再把知识库描述成目录树。
 - `kb_agentic_mode = true` 时核心自己也会加同名工具；本插件先 `get_tool()` 判重，
   已存在就什么都不做 —— 不会出现两个同名工具，也不会替换核心那个实例。
 - 钩子 `priority = -310000`：核心按 priority 降序执行钩子，负数表示靠后，所以本插件排在
-  普通插件（0）之后追加工具；但这**不保证绝对最后**。防同名覆盖靠的是判重，不是顺序。
+  普通插件（0）之后追加工具；但这**不保证绝对最后**。判重保护的是"我们不去覆盖别人"；
+  "被别人覆盖"只能靠排在后面，而那并不保证。
 - 生命周期：没有后台任务、定时器、文件句柄，因此没有 `terminate()` 清理逻辑。
 
 ### 版本兼容
