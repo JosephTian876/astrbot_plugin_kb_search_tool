@@ -62,8 +62,14 @@
 
 1. **加载日志**（控制台或 `data/logs/`）：`[KBTool] 已加载 | 启用=True | 工具=astr_kb_search`
    —— 这行说明插件起来了；显示 `启用=False` 则说明插件被自己的开关关掉了。
-2. **注入日志**：把本插件的日志级别调到 DEBUG（WebUI → 插件 → 该插件），每次请求都会出现
-   `[KBTool] 注入 astr_kb_search，工具数=N`。默认 INFO 级别下不输出，不构成噪音。
+2. **注入日志**：把本插件的日志级别调到 DEBUG，每次请求都会出现
+   `[KBTool] 注入 astr_kb_search，工具数=N`（默认 INFO 下不输出，不构成噪音）。
+   - **AstrBot ≥ 4.26.8**：WebUI → 插件 → 该插件 → 日志级别 → DEBUG
+     （"按插件设置日志级别"这个能力 4.26.8 才引入：`LogManager.set_plugin_log_level`，
+     `core/log.py`；WebUI 入口在 `dashboard/api/plugins.py`）。
+   - **AstrBot 4.23.0–4.26.7**：没有按插件调级别的入口。请把「配置 → 系统配置 →
+     控制台日志级别」改成 DEBUG（配置键 `log_level`，`core/config/default.py`）——
+     效果相同，但会影响全局输出，看完记得改回 INFO。
 3. **两条失败日志的含义**（都自带下一步动作）：
    - `[KBTool] 取不到内置工具 astr_kb_search（后续请求会自动重试）: ...`
      → 核心的内置工具注册表不可用（版本低于 4.23，或某个内置工具模块导入失败）。
