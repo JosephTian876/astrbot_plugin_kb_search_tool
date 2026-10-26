@@ -127,6 +127,22 @@ python -m ruff format --check .
 里面**没有** `astrbot.core`：插件一旦退化回私有导入，测试会立刻失败。
 校验 `metadata.yaml` 需要 `PyYAML`（AstrBot 核心自身也依赖它）。
 
+### 契约冒烟（可选，需要真实 AstrBot 源码）
+
+`tests/contract_smoke.py` 在**真实核心**上验证：公开面导入、`star_map` 注册（删掉
+`@register` 后仍被识别）、钩子 `priority`、真实 `ProviderRequest` 注入与实例同一性、
+导入期无 `DeprecationWarning`。它**默认跳过**（缺 `ASTRBOT_SRC`），不影响上面的
+`pytest -q`；设置环境变量后单独跑：
+
+```powershell
+$env:ASTRBOT_SRC = 'D:\AstrBot\backend\app'   # 4.29.1（生产源码，只读）
+& $py -m pytest tests/contract_smoke.py -q
+
+$env:ASTRBOT_SRC = '<导出目录>'                # 4.23.0（声明下界）
+& $py -m pytest tests/contract_smoke.py -q
+# 导出下界源码树：git archive v4.23.0 astrbot | tar -x -C <导出目录>
+```
+
 ## 许可
 
 MIT
