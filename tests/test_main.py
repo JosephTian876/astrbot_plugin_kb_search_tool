@@ -298,3 +298,31 @@ def test_13_plugin_depends_only_on_public_astrbot_api(plugin_module):
     """插件只依赖 ``astrbot.api`` 公开面：替身里没有 ``astrbot.core`` 也能加载并跑通。"""
     assert plugin_module.KB_TOOL_NAME == "astr_kb_search"
     assert "astrbot.core" not in sys.modules, "插件不该把核心私有模块拖进进程"
+
+
+def test_14_stub_toolset_matches_core_active_semantics():
+    """替身 ``ToolSet.add_tool`` 与核心逐条一致：同名的取舍是「优先 active」，不是「一律覆盖」。
+
+    核心实现见 ``core/agent/tool.py:91-108``；这条用例钉的是**替身本身**——插件永远先
+    ``get_tool`` 判重、走不到这些分支，所以如果替身把契约说简单了，别的用例就会在假语义
+    上通过，而它本该是"核心契约的钉子"。
+    """
+    tool_set = stub.ToolSet()
+    active_tool = stub.FunctionTool("astr_kb_search", active=True)
+    inactive_tool = stub.FunctionTool("astr_kb_search", active=False)
+
+    # 1. 新的不 active、旧的 active → 保留旧的（核心：new_active 为假且 existing 为真）
+    tool_set.add_tool(active_tool)
+    tool_set.add_tool(inactive_tool)
+    assert tool_set.get_tool("astr_kb_search") is active_tool
+    assert len(tool_set.tools) == 1
+
+    # 2. 换成 active 的新工具 → 覆盖（核心：new_active 为真）
+    replacement = stub.FunctionTool("astr_kb_search", active=True)
+    tool_set.add_tool(replacement)
+    assert tool_set.get_tool("astr_kb_search") is replacement
+
+    # 3. 旧的已不 active → 新的即便不 active 也覆盖（核心：not existing_active 为真）
+    tool_set.tools[0].active = False
+    tool_set.add_tool(inactive_tool)
+    assert tool_set.get_tool("astr_kb_search") is inactive_tool

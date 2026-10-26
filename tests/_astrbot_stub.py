@@ -48,14 +48,14 @@ LOGGER.addHandler(_Collector())
 class FunctionTool:
     """``astrbot.core.agent.tool.FunctionTool`` 的最小替身。
 
-    插件只用到 ``name``（判重、日志）与实例身份（"注入的是核心缓存的那一个"）。
-    ``active`` 与核心默认值一致，便于将来若做 active 相关断言。
+    插件只用到 ``name``（判重、日志）与实例身份（"注入的是核心缓存的那一个"）；
+    ``active`` 只被替身的 ``ToolSet.add_tool`` 用来对齐核心的"优先 active"语义。
     """
 
-    def __init__(self, name: str = "tool") -> None:
+    def __init__(self, name: str = "tool", *, active: bool = True) -> None:
         self.name = name
         self.description = ""
-        self.active = True
+        self.active = active
 
     def __repr__(self) -> str:  # 断言失败时的可读输出
         return f"FunctionTool(name={self.name})"
@@ -64,9 +64,17 @@ class FunctionTool:
 class ToolSet:
     """``astrbot.core.agent.tool.ToolSet`` 的最小替身。
 
-    只实现插件用到的 ``tools`` / ``add_tool`` / ``get_tool``，并保留核心的
-    "同名覆盖"语义（``core/agent/tool.py`` 的 ``add_tool``）：这样"不重复、不替换"
-    只能靠插件自己的判重来保证，替身不会替它兜住。
+    只实现插件用到的 ``tools`` / ``add_tool`` / ``get_tool``，但 ``add_tool`` 的语义与
+    核心**逐条对齐**（``core/agent/tool.py:91-108``）：
+
+    - 同名且新工具 ``active`` → 覆盖旧的；
+    - 同名且新工具不 active、旧的 active → **保留旧的**；
+    - 同名且两者都不 active → 覆盖（核心的 ``not existing_active`` 分支）；
+    - 无同名 → 追加到末尾。
+
+    为什么要在替身里也模拟这条："同名覆盖"是核心的**真实**语义，替身若只做最宽松的
+    "有同名就覆盖"，就等于把契约说简单了 —— 而插件真正的保证来自它自己的 ``get_tool``
+    判重（``test_07``），不是替身。替身与核心一致，测试才有资格当契约钉子。
     """
 
     def __init__(self) -> None:
@@ -75,7 +83,10 @@ class ToolSet:
     def add_tool(self, tool: FunctionTool) -> None:
         for index, existing in enumerate(self.tools):
             if existing.name == tool.name:
-                self.tools[index] = tool
+                existing_active = bool(getattr(existing, "active", True))
+                new_active = bool(getattr(tool, "active", True))
+                if new_active or not existing_active:
+                    self.tools[index] = tool
                 return
         self.tools.append(tool)
 
