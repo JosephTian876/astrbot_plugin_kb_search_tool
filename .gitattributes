@@ -1,0 +1,5 @@
+# 统一行尾，让任何机器打出来的包字节一致（R2-B §9.2.1：git archive 在
+# core.autocrlf=true 的机器上会把 .py 转成 CRLF，导致同一份源码打出的 zip 不同）。
+* text=auto eol=lf
+*.py text eol=lf
+*.png binary

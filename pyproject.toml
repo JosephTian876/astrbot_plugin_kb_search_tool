@@ -1,0 +1,29 @@
+# 只放工具配置，不放 [project]：这不是一个可安装的 Python 包，
+# 而是 AstrBot 插件（入口由 AstrBot 的插件加载器决定，见 README）。
+# 目的：让 README「开发」里那三条命令是**真的**质量门，而不是默认规则的弱检查
+# （默认只跑 E4/E7/E9/F，`# noqa: BLE001` 这类注释原本完全不生效）。
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "BLE", "RUF"]
+ignore = [
+    # 本项目所有注释、docstring 与用户文案都是中文。ruff 的 E501 按**显示宽度**算，
+    # 中文占 2 列，88 列只能写 44 个汉字；而 ruff format 不会折行注释/字符串，改不动。
+    # ruff 官方立场：使用 formatter 时不要再开 E501（代码行宽由 format 保证）。
+    "E501",
+    # RUF001/002/003 是「易与 ASCII 混淆的 Unicode 字符」检查，它把中文全角标点
+    # （，。：；（）「」）一律判为可疑 —— 那是中文排版本身，不是笔误。RUF 其余规则
+    # （含 RUF100 未使用 noqa）保留。
+    "RUF001",
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.isort]
+# tests/ 下的本地替身模块，按第一方处理（与第三方 yaml 分开排序）。
+known-first-party = ["_astrbot_stub"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
