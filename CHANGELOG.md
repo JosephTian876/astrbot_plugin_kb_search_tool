@@ -37,7 +37,34 @@
 
 需要 **AstrBot >= 4.23**（`FunctionToolManager.get_builtin_tool()` 自该版本起提供）。
 本轮已在 4.23.0 与 4.29.1 的真实源码上验证：公开面导入、钩子注册（`priority=-310000`）、
-真实 `ProviderRequest` 注入、会话级知识库判定均通过。
+真实 `ProviderRequest` 注入、会话级知识库判定均通过。仓库里可用
+`tests/contract_smoke.py` 复跑（设置 `ASTRBOT_SRC` 指向源码树，见 README「开发」）。
+
+### 二轮审查收口
+
+第二轮独立复审（文档与核心事实的贴合度）+ 回归验证后的收口。**行为无变更**（除下面
+标注的两处日志/类型层面的说明外），配置键与日志前缀不变。
+
+- **文档（阻断项）**：README「如何确认它在工作」的"按插件调 DEBUG"补上版本门禁 ——
+  这个能力 **4.26.8** 才引入（`LogManager.set_plugin_log_level`），4.23.0–4.26.7 请改用
+  「配置 → 系统配置 → 控制台日志级别」。
+- **文档**：`only_when_kb_configured` 的表述从"有可用知识库"改为"配置了非空的知识库"，
+  并写明**不校验知识库是否存在/有内容**（`kb_ids` 指向已删除知识库时仍注入，工具会返回
+  `No relevant knowledge found.`）；`_conf_schema.json` 的 hint 同步。
+- **文档**：第三方 Agent 运行器（dify/coze/dashscope/deerflow）**会**触发 `on_llm_request`，
+  只是它们的 runner 不读 `req.func_tool` —— 原描述"不经过钩子"是错的；同时写清
+  `tool_use` 清零点在 4.23.5 前后分别位于构建期与 runner 期，对"插件注入的工具会不会被
+  丢掉"影响不同。
+- **文档**：安装段改为「插件市场（若已收录）」+「`git clone` 始终可用」。
+- **代码（类型）**：`req` 改用公开面真类型 `astrbot.api.provider.ProviderRequest`，删掉
+  `getattr` 与两处 `# type: ignore`（原注释"它不在公开面里"是事实错误）；注入日志的工具数
+  改用 `len(getattr(tool_set, "tools", ()))`，不再假设自定义 `func_tool` 一定有 `tools`。
+- **仓库**：新增 `.gitattributes`（统一行尾，让任何机器打出的 zip 字节一致）与最小
+  `pyproject.toml`（ruff `select = E,F,W,I,BLE,RUF` + pytest `testpaths`），从此
+  `# noqa: BLE001` 这类注释真的生效。
+- **测试**：新增 `tests/contract_smoke.py`（真实核心契约冒烟，缺 `ASTRBOT_SRC` 时自动
+  跳过）；替身 `ToolSet.add_tool` 与核心的"优先 active"语义逐条对齐；补三条断言
+  （钩子关键字名、非 dict 会话配置、`astrbot_version` 可被 `SpecifierSet` 解析）。
 
 ## 0.1.3 - 2026-10-26
 
