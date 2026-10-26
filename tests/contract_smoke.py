@@ -28,7 +28,12 @@ $env:ASTRBOT_SRC = '<导出目录>'
 3. 钩子注册恰好 1 条、``priority == HOOK_PRIORITY``；
 4. 真实 ``FunctionToolManager`` + 真实 ``ProviderRequest`` 跑一次钩子 → 注入成功，
    且注入的就是核心缓存的那个实例；
-5. 插件模块导入期不产生 ``DeprecationWarning``。
+5. 插件模块导入期不产生 ``DeprecationWarning``；
+6. **版本差异**：真实 ``Context`` 到底有哪些 provider 查询方法（``get_using_provider_async``
+   是 4.27.5 才出现的），并把这个事实记进 evidence；
+7. **注入前判定**：用一个"与真实 ``Context`` 同构"的 shim（4.23–4.26 上没有 async 方法）跑
+   ``modalities=["text"]`` → 跳过、``modalities=None`` → 放行。插件若硬 ``await`` 一个不存在的
+   方法就会 fail-open 静默注入，第 7 条的"应跳过"断言会当场变红 —— 这就是 4.23 下界钉子。
 """
 
 from __future__ import annotations
@@ -154,6 +159,76 @@ def _probe() -> dict[str, object]:
     )
     evidence["injected"] = [tool.name for tool in request.func_tool.tools]
     evidence["injected_is_core_instance"] = True
+
+    # 6. 版本差异：真实 Context 到底有哪些 provider 查询方法。
+    #    ``get_using_provider_async`` 是 4.27.5 才出现的；4.23–4.26 只有同步版
+    #    （4.23.0：core/star/context.py:359）。这条决定插件该走哪条分支。
+    from astrbot.api.star import Context
+
+    provider_api = {
+        "async": hasattr(Context, "get_using_provider_async"),
+        "sync": hasattr(Context, "get_using_provider"),
+        "by_id": hasattr(Context, "get_provider_by_id"),
+    }
+    evidence["provider_api"] = provider_api
+    assert provider_api["sync"], (
+        "Context 必须有同步 get_using_provider（4.23–4.26 唯一入口）"
+    )
+
+    # 7. 用"与真实 Context 同构"的 shim 跑注入前判定：插件只能依赖真实存在的方法。
+    #    旧版本上没有 async 版 → 把 async 方法从 shim 上摘掉，逼插件走同步回退；插件若硬
+    #    await 一个不存在的方法会 fail-open 静默注入，下面的"应跳过"断言就会红。
+    class _FakeProvider:
+        """插件只读 ``provider_config``（真身见 core/provider/provider.py:34）。"""
+
+        def __init__(self, provider_config):
+            self.provider_config = provider_config
+
+    class _ProviderShim(_StubContext):
+        """只暴露真实 ``Context`` 真的有的方法；provider 本身是假的。"""
+
+        def __init__(self, manager, config, provider_config):
+            super().__init__(manager, config)
+            self._provider = _FakeProvider(provider_config)
+
+        async def get_using_provider_async(self, umo=None):
+            return self._provider
+
+        def get_using_provider(self, umo=None):
+            return self._provider
+
+    if not provider_api["async"]:
+        delattr(_ProviderShim, "get_using_provider_async")  # 复刻 4.23–4.26 的形状
+
+    unsupported = ProviderRequest(prompt="hi")
+    asyncio.run(
+        module.KBSearchToolPlugin(
+            _ProviderShim(
+                manager,
+                {"kb_names": ["CONTRACT_KB"]},
+                {"id": "contract/unsupported", "model": "m", "modalities": ["text"]},
+            )
+        ).on_llm_request(_Event("contract:FriendMessage:2"), unsupported)
+    )
+    assert unsupported.func_tool is None, "modalities=['text'] 应跳过注入"
+
+    unconfigured = ProviderRequest(prompt="hi")
+    asyncio.run(
+        module.KBSearchToolPlugin(
+            _ProviderShim(
+                manager,
+                {"kb_names": ["CONTRACT_KB"]},
+                {"id": "contract/unset", "model": "m", "modalities": None},
+            )
+        ).on_llm_request(_Event("contract:FriendMessage:3"), unconfigured)
+    )
+    assert unconfigured.func_tool is not None, "modalities=None 必须 fail-open 注入"
+
+    evidence["provider_gate"] = {
+        "modalities_text": "skip",
+        "modalities_none": "inject",
+        "via": "async" if provider_api["async"] else "sync",
+    }
     return evidence
 
 

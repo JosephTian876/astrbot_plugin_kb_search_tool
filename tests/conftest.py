@@ -90,8 +90,13 @@ def hook():
     刻意不用 ``pytest-asyncio``：测试套件不该为一次 ``asyncio.run`` 引入额外插件依赖。
     """
 
-    def run(plugin, req, umo: str = "aiocqhttp:FriendMessage:10086"):
-        event = _astrbot_stub.AstrMessageEvent(umo)
+    def run(
+        plugin,
+        req,
+        umo: str = "aiocqhttp:FriendMessage:10086",
+        extras: dict | None = None,
+    ):
+        event = _astrbot_stub.AstrMessageEvent(umo, extras=extras)
         asyncio.run(plugin.on_llm_request(event, req))
         return event
 

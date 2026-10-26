@@ -2,6 +2,8 @@
 
 用例 01–10 对应 SYNTHESIS FIX-7 的清单（其中 03 是 FIX-1「会话级知识库」的回归钉），
 11–12 是 FIX-1 验收要求的 fail-open 两个变体，13 是"只依赖 ``astrbot.api`` 公开面"的结构钉。
+16–30 是 provider 工具能力判定（``respect_provider_tool_support``）的判定表 —— 逐行对齐
+``AUDIT-KB.md`` §3.2；其中 29 是"开关关闭 == 0.2.0"的等价性钉子。
 
 所有用例都走**真实入口** ``on_llm_request``（而不是直接调私有方法）：异常吞噬、幂等、日志
 这些契约必须与实际运行时经过同一条路径，否则测的是另一段代码。
@@ -49,17 +51,64 @@ class FakeToolManager:
         return self._tool
 
 
+class FakeProvider:
+    """``astrbot.core.provider.provider.Provider`` 的最小替身：插件只读 ``provider_config``。
+
+    真身的 ``provider_config`` 由 ``AbstractProvider.__init__`` 赋值
+    （``core/provider/provider.py:34``），里面就是 WebUI 那份 provider 配置（含
+    ``modalities``）。``provider_config=None`` 用来模拟"拿到的对象**没有** provider 配置"
+    —— 例如 ``get_provider_by_id`` 返回了 TTS/Embedding 实例（详见 AUDIT-KB §3.2 第 9 行）。
+    """
+
+    def __init__(self, provider_config: dict | None = None) -> None:
+        if provider_config is not None:
+            self.provider_config = provider_config
+
+    def __repr__(self) -> str:  # 断言失败时的可读输出
+        return (
+            f"FakeProvider({getattr(self, 'provider_config', '<无 provider_config>')})"
+        )
+
+
 class FakeContext:
-    """``Context`` 的替身：只实现插件真正调用的两个方法。"""
+    """``Context`` 的替身：知识库判定 + **可选**的 provider 查询能力。
+
+    默认**一个 provider 方法都不提供**：这既是 0.2.0 测试里 ``FakeContext`` 的原貌，也
+    正好复刻"Context 完全没有 provider 查询 API"（旧核心 / 自定义调用方 / 契约冒烟的
+    ``_StubContext``，见 AUDIT-KB §3.2 第 8 行与 §4.3）。
+
+    ``provider_api`` 选择挂哪些方法。方法是**实例属性**：没选中的就真的不存在，插件的
+    ``getattr(context, "...", None)`` 探测才会得到 ``None``（这是版本差异的关键——4.27.5
+    之前没有 async 版）：
+
+    - ``"async"`` → ``get_using_provider_async(umo=...)``（**4.27.5+** 才有）
+    - ``"sync"`` → ``get_using_provider(umo=...)``（4.23–4.26 的唯一入口）
+    - ``"by_id"`` → ``get_provider_by_id(provider_id)``（会话级 ``selected_provider``）
+    """
 
     def __init__(
-        self, manager, *, kb_names=None, raises: Exception | None = None
+        self,
+        manager,
+        *,
+        kb_names=None,
+        raises: Exception | None = None,
+        provider=None,
+        provider_api=(),
+        providers_by_id: dict | None = None,
+        provider_error: BaseException | None = None,
     ) -> None:
         self._manager = manager
         self.kb_names = list(kb_names or [])
         self.raises = raises
         #: 每次 ``get_config`` 收到的 umo，用来钉住"按会话取配置"而不是只读默认配置。
         self.config_umos: list[str | None] = []
+        self.provider = provider
+        self.providers_by_id = dict(providers_by_id or {})
+        #: 设为异常后每次 provider 查询都抛它；``BaseException`` 也行（见 ``_Forbidden``）。
+        self.provider_error = provider_error
+        #: 每次 provider 查询记一条 ``"<方法>:<参数>"``；"该查/不该查"全靠它断言。
+        self.provider_calls: list[str] = []
+        self._install_provider_api(provider_api)
 
     def get_llm_tool_manager(self):
         return self._manager
@@ -70,6 +119,40 @@ class FakeContext:
             raise self.raises
         return {"kb_names": list(self.kb_names)}
 
+    def _install_provider_api(self, kinds) -> None:
+        kinds = set(kinds)
+
+        async def get_using_provider_async(umo=None):
+            self.provider_calls.append(f"async:{umo}")
+            self._raise_provider_error()
+            return self.provider
+
+        def get_using_provider(umo=None):
+            self.provider_calls.append(f"sync:{umo}")
+            self._raise_provider_error()
+            return self.provider
+
+        def get_provider_by_id(provider_id):
+            self.provider_calls.append(f"by_id:{provider_id}")
+            self._raise_provider_error()
+            return self.providers_by_id.get(provider_id)
+
+        for kind, func in (
+            ("async", get_using_provider_async),
+            ("sync", get_using_provider),
+            ("by_id", get_provider_by_id),
+        ):
+            if kind in kinds:
+                setattr(self, func.__name__, func)
+
+    def _raise_provider_error(self) -> None:
+        if self.provider_error is not None:
+            raise self.provider_error
+
+
+#: "配置里没有 ``modalities`` 这个键"——必须与 ``None`` 区分开（AUDIT-KB §3.2 第 10 行）。
+MISSING = object()
+
 
 def make_plugin(
     plugin_module,
@@ -78,13 +161,52 @@ def make_plugin(
     kb_names: list[str] | None = None,
     tool_raises: Exception | None = None,
     config_raises: Exception | None = None,
+    provider=None,
+    provider_api=(),
+    providers_by_id: dict | None = None,
+    provider_error: BaseException | None = None,
 ):
     """构造被测插件，返回 ``(plugin, manager, context, tool)``。"""
     tool = stub.FunctionTool(plugin_module.KB_TOOL_NAME)
     manager = FakeToolManager(tool, raises=tool_raises)
-    context = FakeContext(manager, kb_names=kb_names, raises=config_raises)
+    context = FakeContext(
+        manager,
+        kb_names=kb_names,
+        raises=config_raises,
+        provider=provider,
+        provider_api=provider_api,
+        providers_by_id=providers_by_id,
+        provider_error=provider_error,
+    )
     plugin = plugin_module.KBSearchToolPlugin(context, config)
     return plugin, manager, context, tool
+
+
+def make_provider_case(
+    plugin_module,
+    modalities=MISSING,
+    *,
+    api=("async", "sync"),
+    provider_id="siliconflow/qwen3-vl-30b-a3b",
+    model="qwen3-vl-30b-a3b",
+    config: dict | None = None,
+    **kwargs,
+):
+    """「当前 provider 有明确能力声明」的插件：知识库已配置，provider 查询 API 齐全。
+
+    ``modalities=MISSING`` 表示配置里**没有**这个键（与 ``None`` 是两种不同的输入）。
+    """
+    provider_config = {"id": provider_id, "model": model}
+    if modalities is not MISSING:
+        provider_config["modalities"] = modalities
+    return make_plugin(
+        plugin_module,
+        config=dict(config) if config else None,
+        kb_names=["kb1"],
+        provider=FakeProvider(provider_config),
+        provider_api=api,
+        **kwargs,
+    )
 
 
 def messages(logs, level: int) -> list[str]:
@@ -352,3 +474,541 @@ def test_15_non_dict_session_config_falls_back_to_global(plugin_module, hook, sp
 
     # 每次都读了主配置 → 确实走了 kb_names 兜底，而不是被当成会话级配置短路。
     assert context.config_umos == [umo] * 4
+
+
+# ---------------------------------------------------------------------------
+# provider 工具能力判定（``respect_provider_tool_support``，AUDIT-KB §3.2 判定表 16 行）
+#
+# 判据只有一条：**``modalities`` 是非空 list 且不含 ``tool_use``** 才算"不支持工具"。
+# ``None`` / ``[]`` / 缺键 / 非 list / 取不到 provider / 探测抛异常一律 fail-open 注入
+# （AUDIT-KB §0.2：4.29 把空值当"未配置，默认支持全部模态"，按否定信号处理会让绝大多数
+# 没填"模型能力"的用户直接失去工具）。
+# ---------------------------------------------------------------------------
+
+
+def test_16_skips_injection_when_modalities_excludes_tool_use(
+    plugin_module, hook, logs
+):
+    """§3.2 第 13 行：``modalities`` 非空且不含 ``tool_use`` → 跳过注入 + WARNING 一次。"""
+    plugin, _, context, _ = make_provider_case(plugin_module, ["text"])
+
+    for _ in range(3):  # 同一 provider+model：告警只该出现一次
+        req = stub.ProviderRequest()
+        hook(plugin, req)
+        assert req.func_tool is None
+
+    warnings = messages(logs, logging.WARNING)
+    assert len(warnings) == 1, "同一 provider+model 只告警一次，否则每请求刷屏"
+    assert "tool_use" in warnings[0] and "respect_provider_tool_support" in warnings[0]
+    assert "siliconflow/qwen3-vl-30b-a3b" in warnings[0], "告警必须指出是哪个 provider"
+    assert messages(logs, logging.DEBUG) == [], "跳过时不该有注入日志"
+    assert messages(logs, logging.ERROR) == []
+    # 仍然每请求都查：用户切了 provider/模型要立刻生效，而不是沿用上次判断。
+    assert context.provider_calls == ["async:aiocqhttp:FriendMessage:10086"] * 3
+
+    # 换了模型（同一 provider id）→ 必须再提醒一次：去重键是 provider+model。
+    plugin2, _, _, _ = make_provider_case(plugin_module, ["text"], model="qwen3-vl-7b")
+    hook(plugin2, stub.ProviderRequest())
+    warnings = messages(logs, logging.WARNING)
+    assert len(warnings) == 2 and "qwen3-vl-7b" in warnings[1]
+
+
+def test_17_injects_when_modalities_lists_tool_use(plugin_module, hook, logs):
+    """§3.2 第 12 行：``modalities`` 含 ``tool_use`` → 正常注入，不多打日志。"""
+    plugin, _, context, tool = make_provider_case(plugin_module, ["text", "tool_use"])
+
+    req = stub.ProviderRequest()
+    hook(plugin, req)
+
+    assert req.func_tool is not None
+    assert req.func_tool.get_tool(plugin_module.KB_TOOL_NAME) is tool
+    assert messages(logs, logging.WARNING) == []
+    assert messages(logs, logging.ERROR) == []
+    debug = messages(logs, logging.DEBUG)
+    assert len(debug) == 1, "支持工具是正常路径：只留一条注入 DEBUG"
+    assert plugin_module.KB_TOOL_NAME in debug[0]
+    assert context.provider_calls == ["async:aiocqhttp:FriendMessage:10086"]
+
+
+@pytest.mark.parametrize(
+    ("modalities", "reason"),
+    [
+        (MISSING, "缺键"),
+        (None, "None"),
+        ([], "空 list"),
+        ("text", "字符串"),
+        ({"tool_use": True}, "dict"),
+        (("text", "tool_use"), "tuple"),
+        (123, "int"),
+    ],
+)
+def test_18_unknown_or_unconfigured_modalities_fail_open(
+    plugin_module, hook, logs, modalities, reason
+):
+    """§3.2 第 10/11 行：``None`` / ``[]`` / 缺键 / 非 list 一律 fail-open（4.29 语义）。
+
+    ``tuple`` 也在表里：核心只认 ``isinstance(list)``（``tool_loop_agent_runner.py:680-686``），
+    tuple 既不会被核心清空，也不能当否定信号 —— 插件同样按"未知"放行。
+    """
+    plugin, _, _, tool = make_provider_case(plugin_module, modalities)
+
+    req = stub.ProviderRequest()
+    hook(plugin, req)
+
+    assert req.func_tool is not None, f"{reason} 不能被当成'不支持工具'"
+    assert req.func_tool.get_tool(plugin_module.KB_TOOL_NAME) is tool
+    assert messages(logs, logging.WARNING) == []
+    assert messages(logs, logging.ERROR) == []
+    debug = messages(logs, logging.DEBUG)
+    assert len(debug) == 2, f"{reason}：一条'按支持处理'的 DEBUG + 一条注入 DEBUG"
+    assert sum("按支持处理" in message for message in debug) == 1
+
+
+def test_19_provider_probe_exception_fails_open_with_one_debug(
+    plugin_module, hook, logs
+):
+    """§3.2 第 9 行：查询抛异常 → 注入 + 一次 DEBUG（按原因去重）+ 绝不 ERROR 刷屏。"""
+    plugin, _, context, tool = make_provider_case(
+        plugin_module, ["text"], provider_error=RuntimeError("database is locked")
+    )
+
+    for _ in range(3):
+        req = stub.ProviderRequest()
+        hook(plugin, req)
+        assert req.func_tool is not None
+        assert req.func_tool.get_tool(plugin_module.KB_TOOL_NAME) is tool
+
+    assert messages(logs, logging.ERROR) == [], "探测异常必须自己吞掉"
+    debug = messages(logs, logging.DEBUG)
+    assert sum("按支持处理" in message for message in debug) == 1, (
+        "同一原因只 DEBUG 一次"
+    )
+    assert sum("RuntimeError" in message for message in debug) == 1
+    assert len(context.provider_calls) == 3, (
+        "每次请求仍会尝试（换 provider 后要立刻生效）"
+    )
+
+
+def test_20_provider_none_fails_open(plugin_module, hook, logs):
+    """§3.2 第 8b 行：查询方法存在但返回 ``None``（没有可用 provider）→ 注入 + DEBUG 一次。"""
+    plugin, _, context, tool = make_plugin(
+        plugin_module,
+        kb_names=["kb1"],
+        provider=None,
+        provider_api=("async", "sync"),
+    )
+
+    for _ in range(2):
+        req = stub.ProviderRequest()
+        hook(plugin, req)
+        assert req.func_tool is not None
+        assert req.func_tool.get_tool(plugin_module.KB_TOOL_NAME) is tool
+
+    debug = messages(logs, logging.DEBUG)
+    assert sum("provider=None" in message for message in debug) == 1
+    assert messages(logs, logging.WARNING) == []
+    assert messages(logs, logging.ERROR) == []
+    assert len(context.provider_calls) == 2
+
+
+@pytest.mark.parametrize("case", ["not_a_chat_provider", "value_error"])
+def test_21_non_chat_provider_fails_open(plugin_module, hook, logs, case):
+    """§3.2 第 9 行：拿到非聊天 Provider / 查询抛 ``ValueError`` → 一律 fail-open。
+
+    核心 ``Context.get_using_provider`` 在类型不对时**自己抛** ``ValueError``
+    （``core/star/context.py:508-512``）；``get_provider_by_id`` 则可能返回 TTS/Embedding
+    实例（没有 ``provider_config``）。两条路径都必须落到"未知 → 注入"。
+    """
+    if case == "not_a_chat_provider":
+        plugin, _, _, tool = make_plugin(
+            plugin_module,
+            kb_names=["kb1"],
+            provider=FakeProvider(None),
+            provider_api=("async",),
+        )
+        expected = "provider_config"
+    else:
+        plugin, _, _, tool = make_plugin(
+            plugin_module,
+            kb_names=["kb1"],
+            provider_api=("async",),
+            provider_error=ValueError("该会话来源的对话模型（提供商）的类型不正确"),
+        )
+        expected = "ValueError"
+
+    req = stub.ProviderRequest()
+    hook(plugin, req)
+
+    assert req.func_tool is not None
+    assert req.func_tool.get_tool(plugin_module.KB_TOOL_NAME) is tool
+    debug = messages(logs, logging.DEBUG)
+    assert sum("按支持处理" in message for message in debug) == 1
+    assert sum(expected in message for message in debug) == 1
+    assert messages(logs, logging.WARNING) == []
+    assert messages(logs, logging.ERROR) == []
+
+
+@pytest.mark.parametrize(
+    ("modalities", "injected"),
+    [(["text"], False), (["text", "tool_use"], True)],
+)
+def test_22_legacy_context_falls_back_to_sync_getter(
+    plugin_module, hook, logs, modalities, injected
+):
+    """硬约束 1 / §3.2 第 9 行：4.23–4.26 只有同步 ``get_using_provider``，必须回退过去。
+
+    这条钉的是**声明下界 4.23**（``metadata.yaml:8``）：直接 ``await
+    context.get_using_provider_async(...)`` 会在 4.23–4.26 上每请求 ``AttributeError``，
+    被外层吞掉后插件静默失效。回退是否成功不能只看"注入了"（fail-open 也会注入），
+    所以两个变体都断言：同步方法被调用恰好 1 次 **且** 真的读到了 ``modalities``。
+    """
+    plugin, _, context, tool = make_provider_case(
+        plugin_module, modalities, api=("sync",)
+    )
+
+    req = stub.ProviderRequest()
+    hook(plugin, req)
+
+    assert context.provider_calls == ["sync:aiocqhttp:FriendMessage:10086"], (
+        "旧核心只有同步方法：必须走回退，而不是抛 AttributeError 后 fail-open"
+    )
+    assert (req.func_tool is not None) is injected
+    if injected:
+        assert req.func_tool.get_tool(plugin_module.KB_TOOL_NAME) is tool
+    assert messages(logs, logging.ERROR) == []
+    assert len(messages(logs, logging.WARNING)) == (0 if injected else 1)
+
+
+def test_22b_no_provider_api_is_a_silent_fail_open(plugin_module, hook, logs):
+    """§3.2 第 8 行：Context 完全没有 provider 查询能力 → **静默** fail-open。
+
+    静默是契约而非疏忽：``test_01`` 断言成功注入路径**恰好 1 条** DEBUG；这条路径若也打
+    一条"按支持处理"，``test_01`` 就退化成 2 条。契约冒烟的 ``_StubContext`` 同样是这个
+    形状（AUDIT-KB §4.3 的 CI 哨兵）。
+    """
+    plugin, _, context, tool = make_plugin(plugin_module, kb_names=["kb1"])
+
+    req = stub.ProviderRequest()
+    hook(plugin, req)
+
+    assert req.func_tool is not None
+    assert req.func_tool.get_tool(plugin_module.KB_TOOL_NAME) is tool
+    assert context.provider_calls == []
+    debug = messages(logs, logging.DEBUG)
+    assert len(debug) == 1 and plugin_module.KB_TOOL_NAME in debug[0]
+    assert messages(logs, logging.WARNING) == []
+    assert messages(logs, logging.ERROR) == []
+
+
+def test_23_switch_off_never_queries_the_provider(plugin_module, hook, logs):
+    """§3.2 第 7 行：``respect_provider_tool_support=false`` → 0.2.0 旧行为（总是注入）。
+
+    两个变体：provider 明确"不支持工具"、provider 查询直接爆炸 —— 开关关闭时都不该被碰
+    一下（``provider_calls`` 为空、没有任何新增日志）。
+    """
+    cases = (
+        (FakeProvider({"id": "p", "model": "m", "modalities": ["text"]}), None),
+        (None, RuntimeError("开关关闭时不该被调用")),
+    )
+    for provider, error in cases:
+        plugin, _, context, tool = make_plugin(
+            plugin_module,
+            kb_names=["kb1"],
+            config={"respect_provider_tool_support": False},
+            provider=provider,
+            provider_api=("async", "sync"),
+            provider_error=error,
+        )
+        req = stub.ProviderRequest()
+        hook(plugin, req)
+        assert req.func_tool is not None
+        assert req.func_tool.get_tool(plugin_module.KB_TOOL_NAME) is tool
+        assert context.provider_calls == []
+
+    assert messages(logs, logging.WARNING) == []
+    assert messages(logs, logging.ERROR) == []
+    assert len(messages(logs, logging.DEBUG)) == 2, "两次跑都只有注入那一条 DEBUG"
+
+
+@pytest.mark.parametrize(
+    ("selected", "session_modalities", "selected_modalities", "injected", "calls"),
+    [
+        # 会话默认 provider 支持工具，但 WebUI 选了"不支持"的那个 → 以会话选择为准，跳过。
+        ("p-sel", ["text", "tool_use"], ["text"], False, ["by_id:p-sel"]),
+        # 反过来：默认不支持，用户选了支持的那个 → 注入。
+        ("p-sel", ["text"], ["text", "tool_use"], True, ["by_id:p-sel"]),
+        # selected 指向已删除的 provider → 回落到会话默认 provider（核心同序）。
+        ("p-gone", ["text"], None, False, ["by_id:p-gone", "async:umo-1"]),
+    ],
+)
+def test_24_selected_provider_is_what_gets_judged(
+    plugin_module,
+    hook,
+    logs,
+    selected,
+    session_modalities,
+    selected_modalities,
+    injected,
+    calls,
+):
+    """§3.2 补充：会话级 ``selected_provider``（WebUI 选模型）优先于会话默认 provider。
+
+    核心 ``_select_provider`` 就是这个顺序（``core/astr_main_agent.py:283-304``）；不镜像
+    会在用户切到"不支持工具"的模型时判错对象、或在切到支持工具时误跳过。
+    """
+    providers_by_id = {}
+    if selected_modalities is not None:
+        providers_by_id[selected] = FakeProvider(
+            {"id": selected, "model": "m-sel", "modalities": selected_modalities}
+        )
+    plugin, _, context, tool = make_plugin(
+        plugin_module,
+        kb_names=["kb1"],
+        provider=FakeProvider(
+            {"id": "p-session", "model": "m-session", "modalities": session_modalities}
+        ),
+        provider_api=("async", "by_id"),
+        providers_by_id=providers_by_id,
+    )
+
+    req = stub.ProviderRequest()
+    hook(plugin, req, umo="umo-1", extras={"selected_provider": selected})
+
+    assert context.provider_calls == calls
+    assert (req.func_tool is not None) is injected
+    if injected:
+        assert req.func_tool.get_tool(plugin_module.KB_TOOL_NAME) is tool
+        assert messages(logs, logging.WARNING) == []
+    else:
+        warnings = messages(logs, logging.WARNING)
+        assert len(warnings) == 1
+        expected_id = selected if selected_modalities is not None else "p-session"
+        assert expected_id in warnings[0], "告警必须指出真正被判否的那个 provider"
+    assert messages(logs, logging.ERROR) == []
+
+
+@pytest.mark.parametrize(
+    ("image_urls", "modalities", "injected", "fallback_debug"),
+    [
+        # 图片请求 + 主 provider 不支持 image → 核心可能切 fallback provider，能力未知 → 放行。
+        (["http://x/a.png"], ["text"], True, True),
+        # 主 provider 能看图 → 不会切 fallback → 判的是它本身 → 跳过。
+        (["http://x/a.png"], ["text", "image"], False, False),
+        # 没有图片 → 与图片无关 → 正常判否。
+        ([], ["text"], False, False),
+    ],
+)
+def test_25_image_requests_fail_open_only_when_fallback_is_possible(
+    plugin_module, hook, logs, image_urls, modalities, injected, fallback_debug
+):
+    """§3.2 第 14 行：图片 fallback 歧义时 fail-open。
+
+    依据核心 ``_provider_supports_modality`` + ``_select_image_chat_provider``
+    （``core/astr_main_agent.py:1412-1443``）：只有 ``req.image_urls`` 非空**且**主 provider
+    的 ``modalities`` 不含 ``image`` 时才会切到 fallback provider。此时"当前 provider 不支持
+    工具"不等于"这次请求用的 provider 不支持工具"，所以按未知放行。
+    """
+    plugin, _, _, tool = make_provider_case(plugin_module, modalities)
+
+    req = stub.ProviderRequest(image_urls=image_urls)
+    hook(plugin, req)
+
+    assert (req.func_tool is not None) is injected
+    if injected:
+        assert req.func_tool.get_tool(plugin_module.KB_TOOL_NAME) is tool
+    debug = messages(logs, logging.DEBUG)
+    assert sum("fallback" in message for message in debug) == int(fallback_debug)
+    assert len(messages(logs, logging.WARNING)) == (0 if injected else 1)
+    assert messages(logs, logging.ERROR) == []
+
+
+def test_26_no_kb_returns_before_the_provider_probe(plugin_module, hook, logs):
+    """顺序钉子（§3.1）：KB 判定在 provider 判定之前 → 无知识库时一次 provider 都不查。"""
+    plugin, _, context, _ = make_plugin(
+        plugin_module,
+        kb_names=[],
+        provider=FakeProvider({"id": "p", "model": "m", "modalities": ["text"]}),
+        provider_api=("async", "sync"),
+    )
+
+    for _ in range(2):
+        req = stub.ProviderRequest()
+        hook(plugin, req)
+        assert req.func_tool is None
+
+    assert context.provider_calls == [], "最常见的早退路径不该付 provider 查询成本"
+    warnings = messages(logs, logging.WARNING)
+    assert len(warnings) == 1, "只出既有的 no-KB 告警（一次），不叠加 provider 告警"
+    assert "only_when_kb_configured" in warnings[0]
+    assert messages(logs, logging.ERROR) == []
+
+
+def test_27_non_standard_func_tool_keeps_0_2_0_behavior(plugin_module, hook, logs):
+    """AUDIT-KB §3.2 第 4 行**未在本轮实现**：非标准 ``func_tool`` 仍是"ERROR 一次 + 不注入"。
+
+    为什么不顺手加防御：本轮硬约束是"开关关闭时逐字节等价 0.2.0"。给这条输入加防御会让
+    它从 ERROR 变成 DEBUG（日志可观察行为变了），等价性就不再成立；AUDIT-KB §7 第 6 行也
+    把它列为"本轮不修"的残余风险（非公开契约的边缘）。
+
+    本用例的价值是把现状钉成**与开关无关**：两个开关值下行为完全一致，所以等价性成立。
+    """
+    for switch in (True, False):
+        plugin, _, context, _ = make_provider_case(
+            plugin_module,
+            ["text"],
+            config={"respect_provider_tool_support": switch},
+        )
+
+        class FunctionToolBag:  # 只有 add_tool，没有 get_tool
+            def __init__(self) -> None:
+                self.added = []
+
+            def add_tool(self, tool) -> None:
+                self.added.append(tool)
+
+        bag = FunctionToolBag()
+        req = stub.ProviderRequest(func_tool=bag)
+        hook(plugin, req)  # 不抛即通过（异常由外层 hook 吞掉）
+        assert bag.added == [], "拿不到 get_tool 就不该往里塞工具"
+        assert context.provider_calls == [], (
+            "同名判重阶段就失败了，轮不到 provider 判定"
+        )
+
+    errors = messages(logs, logging.ERROR)
+    assert len(errors) == 2, "每个开关值各一条：异常被外层吞掉并留痕（0.2.0 行为）"
+    assert all("get_tool" in message for message in errors)
+    assert messages(logs, logging.WARNING) == []
+
+
+def test_28_conf_schema_and_plugin_read_the_same_config_keys(plugin_module):
+    """配置键 1:1：``_conf_schema.json`` 的键 == 插件真正读取的键，默认值一致。
+
+    插件没有配置 dataclass（只有 ``__init__`` 里的属性），所以"1:1"落在这两件事上：
+    schema 的键集合是显式的、且**每个键都真的被读进属性**。少一个 = 面板上有个死开关；
+    多一个 = 代码读了一个面板里不存在的键。
+    """
+    schema = json.loads((REPO_ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
+    assert set(schema) == {
+        "enable",
+        "only_when_kb_configured",
+        "respect_provider_tool_support",
+    }
+
+    item = schema["respect_provider_tool_support"]
+    assert item["type"] == "bool", "非 bool 会让面板渲染成输入框"
+    assert item["default"] is True, "默认必须是 true：false 等于没修（AUDIT-KB §3.4）"
+    assert item["description"]
+    hint = item["hint"]
+    assert "tool_use" in hint, "hint 必须写清判据里的关键词"
+    assert "非空" in hint, "hint 必须写清'非空 list'"
+    assert "放行" in hint, "hint 必须写清未知/空值一律放行（fail-open）"
+    assert "respect_provider_tool_support" in hint, "hint 要告诉用户关闭后回到旧行为"
+
+    # 默认值：三个键都从默认配置读出 True。
+    plugin, _, _, _ = make_plugin(plugin_module)
+    assert plugin.enabled is True
+    assert plugin.only_when_kb_configured is True
+    assert plugin.respect_provider_tool_support is True
+
+    # 每个键都真的被读取（不是死字段）。
+    plugin, _, _, _ = make_plugin(
+        plugin_module,
+        config={
+            "enable": False,
+            "only_when_kb_configured": False,
+            "respect_provider_tool_support": False,
+        },
+    )
+    assert plugin.enabled is False
+    assert plugin.only_when_kb_configured is False
+    assert plugin.respect_provider_tool_support is False
+
+
+#: 开关关闭时若碰了 provider 就会抛出它。
+#:
+#: 刻意继承 ``BaseException``：插件的 ``except Exception``（provider 探测）与钩子的
+#: ``except Exception``（兜底）都拦不住 —— 一旦误触，用例会以"未捕获异常"失败，而不是被
+#: fail-open 悄悄吞掉后"看起来通过"。
+class _ProviderMustNotBeTouched(BaseException):
+    pass
+
+
+@pytest.mark.parametrize(
+    "modalities",
+    [MISSING, None, [], ["text"], ["text", "tool_use"], "text", {"x": 1}],
+)
+@pytest.mark.parametrize("kb_names", [["kb1"], []])
+def test_29_switch_off_is_observably_identical_to_0_2_0(
+    plugin_module, hook, logs, modalities, kb_names
+):
+    """开关关闭 → provider 状态对结果**零影响**、零新增日志 = 逐字节等价 0.2.0。
+
+    做法：把 provider 查询装成"一碰就抛 ``BaseException``"的陷阱。0.2.0 的 ``_ensure_tool``
+    从不查 provider，所以它在这张矩阵（全部 modalities 形态 × 有无知识库）上应当一次都不
+    触发；用例同时钉住注入结果与日志级别/条数/文案——等价性里"可观察行为"的部分。
+    """
+    provider_config = {"id": "p", "model": "m"}
+    if modalities is not MISSING:
+        provider_config["modalities"] = modalities
+    plugin, _, context, tool = make_plugin(
+        plugin_module,
+        kb_names=kb_names,
+        config={"respect_provider_tool_support": False},
+        provider=FakeProvider(provider_config),
+        provider_api=("async", "sync", "by_id"),
+        provider_error=_ProviderMustNotBeTouched("开关关闭时不该查询 provider"),
+    )
+
+    req = stub.ProviderRequest()
+    hook(plugin, req)  # 触发陷阱即失败（两处 except Exception 都拦不住）
+
+    assert context.provider_calls == []
+    if kb_names:
+        assert req.func_tool is not None
+        assert req.func_tool.get_tool(plugin_module.KB_TOOL_NAME) is tool
+        assert messages(logs, logging.DEBUG) == [
+            f"[KBTool] 注入 {plugin_module.KB_TOOL_NAME}，工具数=1"
+        ]
+        assert messages(logs, logging.WARNING) == []
+    else:
+        assert req.func_tool is None
+        assert messages(logs, logging.DEBUG) == []
+        assert len(messages(logs, logging.WARNING)) == 1
+    assert messages(logs, logging.ERROR) == []
+
+
+def test_30_only_when_kb_configured_off_injects_without_kb(plugin_module, hook, logs):
+    """§3.2 第 6 行（+ 第 13 行叠加）：关掉知识库闸门时无知识库也注入，但 provider 闸门照旧。
+
+    两个开关是**独立**的：`only_when_kb_configured=false` 让"没有知识库"不再阻止注入，
+    而 `respect_provider_tool_support` 仍然在 provider 明确不支持工具时拦下这次注入。
+    """
+    plugin, _, _, tool = make_plugin(
+        plugin_module,
+        config={"only_when_kb_configured": False},
+        kb_names=[],
+        provider=FakeProvider(
+            {"id": "p", "model": "m", "modalities": ["text", "tool_use"]}
+        ),
+        provider_api=("async",),
+    )
+    req = stub.ProviderRequest()
+    hook(plugin, req)
+    assert req.func_tool is not None, "关掉知识库闸门后应立即注入"
+    assert req.func_tool.get_tool(plugin_module.KB_TOOL_NAME) is tool
+    assert messages(logs, logging.WARNING) == [], "没有知识库告警：闸门已关"
+
+    # 同一份配置，provider 明确不支持工具 → 仍然跳过（知识库闸门关不代表 provider 闸门关）。
+    plugin2, _, _, _ = make_plugin(
+        plugin_module,
+        config={"only_when_kb_configured": False},
+        kb_names=[],
+        provider=FakeProvider({"id": "p2", "model": "m", "modalities": ["text"]}),
+        provider_api=("async",),
+    )
+    req2 = stub.ProviderRequest()
+    hook(plugin2, req2)
+    assert req2.func_tool is None
+    warnings = messages(logs, logging.WARNING)
+    assert len(warnings) == 1 and "tool_use" in warnings[0]
+    assert messages(logs, logging.ERROR) == []

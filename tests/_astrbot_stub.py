@@ -119,21 +119,41 @@ SP = _SharedPreferences()
 class ProviderRequest:
     """``astrbot.core.provider.entities.ProviderRequest`` 的最小替身。
 
-    插件只读写 ``func_tool`` 这一个字段；``prompt`` / ``contexts`` 等字段插件不碰，
-    替身就不提供 —— 与其它替身一样，只给插件真正用到的成员。
+    插件只读写 ``func_tool`` 与（只读）``image_urls`` 两个字段；``prompt`` / ``contexts``
+    等字段插件不碰，替身就不提供 —— 与其它替身一样，只给插件真正用到的成员。
     """
 
-    def __init__(self, func_tool: ToolSet | None = None) -> None:
+    def __init__(
+        self, func_tool: ToolSet | None = None, image_urls: list[str] | None = None
+    ) -> None:
         self.func_tool = func_tool
+        #: 真实字段（``core/provider/entities.py:100``）。图片 fallback 判定要读它：
+        #: 主 provider 不支持 image 时核心会切到 fallback provider（见 README「边界」）。
+        self.image_urls = list(image_urls or [])
 
 
 class AstrMessageEvent:
-    """``AstrMessageEvent`` 的最小替身：插件只读 ``unified_msg_origin``。"""
+    """``AstrMessageEvent`` 的最小替身：插件只读 ``unified_msg_origin`` 与 ``get_extra``。
+
+    ``get_extra`` / ``set_extra`` 与核心同名同行为（``core/platform/astr_message_event.py``
+    的 ``_extras`` 字典）；插件用它读会话级 ``selected_provider``。
+    """
 
     def __init__(
-        self, unified_msg_origin: str = "aiocqhttp:FriendMessage:10086"
+        self,
+        unified_msg_origin: str = "aiocqhttp:FriendMessage:10086",
+        extras: dict | None = None,
     ) -> None:
         self.unified_msg_origin = unified_msg_origin
+        self._extras: dict[str, object] = dict(extras or {})
+
+    def set_extra(self, key, value) -> None:
+        self._extras[key] = value
+
+    def get_extra(self, key: str | None = None, default=None):
+        if key is None:
+            return self._extras
+        return self._extras.get(key, default)
 
 
 class _Filter:
