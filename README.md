@@ -16,13 +16,18 @@
   provider 的「模型能力」没勾「工具使用」（`tool_use`）时核心会清空工具，但清零点变过：
   - **< 4.23.5（实测 4.23.0 / 4.23.1 / 4.23.2）**：清空在构建期
     （`core/astr_main_agent.py` 的 `_modalities_fix`；4.23.0 在 `:826` 定义、`:1396` 调用），
-    早于 `on_llm_request`（钩子在 `build_main_agent` 之后触发）—— 本插件随后注入的工具
+    早于 `on_llm_request`（钩子在 `build_main_agent` 之后触发）—— 0.2.0 注入的工具
     **不会被清掉**，会带着工具发给一个不支持工具调用的 provider（后果取决于 provider SDK，
     可能直接报错）。
   - **≥4.23.5**：清空移到 runner（4.29.1：`core/agent/runners/tool_loop_agent_runner.py`
     的 `_func_tool_for_provider`），在 `reset()` 时执行，晚于钩子（`internal.py` 先
-    触发钩子、再 `await reset_coro`）—— 本插件注入的工具也会被丢掉。
-  所以无论哪个版本，都要给会话用的 provider 勾上「工具使用」。
+    触发钩子、再 `await reset_coro`）—— 注入的工具也会被丢掉。
+
+  **0.2.1 起本插件自己尊重这个声明**：只有当「当前会话实际使用的 provider 的
+  `modalities` 是**非空 list 且不含 `tool_use`**」时才跳过注入（WARNING 一次），其余
+  情况（`None`／`[]`／没这个键／不是 list／取不到 provider／读取抛异常）一律按支持处理、
+  照常注入。判据与核心 `_func_tool_for_provider` 逐字对齐；要回到 0.2.0 的「总是注入」，
+  把 `respect_provider_tool_support` 关掉即可（见「配置项」与「适用范围与边界」）。
 - **AstrBot >= 4.23**：`FunctionToolManager.get_builtin_tool()` 自该版本起才提供。
 
 ## 2. 解决的问题
@@ -66,10 +71,11 @@
 |---|---|---|
 | `enable` | `true` | 总开关。关闭后本插件不介入任何请求。 |
 | `only_when_kb_configured` | `true` | 只在「当前会话或主配置里**配置了非空**的知识库」时注入。判定顺序与核心检索一致：会话级 `kb_config.kb_ids` 优先、主配置 `kb_names` 兜底（`core/tools/knowledge_base_tools.py`）。**不校验知识库是否存在或是否有内容**（那要读核心私有面，本插件不碰），所以 `kb_ids` 指向已删除的知识库时仍会注入，此时工具会返回 `No relevant knowledge found.`。关闭后总是注入。 |
+| `respect_provider_tool_support` | `true` | 注入前读一次「当前会话实际使用的 provider」的「模型能力（`modalities`）」：**只有**它是「非空 list 且不含 `tool_use`」时才跳过注入并 WARNING 一次（每个 provider+model 一次）。`modalities` 为 `None`／空 list／缺键／非 list、取不到 provider、读取抛异常 —— 一律按支持处理、照常注入（fail-open，与核心「未配置=默认支持全部模态」一致）；图片请求可能被核心切给 fallback provider 时同样按支持处理。关掉即回到 0.2.0 的「总是注入」。**注意「配置 ≠ 真实能力」**：模型其实支持函数调用、只是没勾「工具使用」时也会被跳过 —— 看到那条 WARNING 就去 WebUI 的 provider 设置里确认；4.23–4.26 没有 `get_using_provider_async()`，会回退同步查询（见「适用范围与边界」）。 |
 
 > `kb_agentic_mode=true` 时工具由核心自己添加（`core/astr_main_agent.py` 的 `_apply_kb`
-> 的 else 分支），本插件检测到同名工具已存在就什么都不做 —— 这种配置下上面两个开关都
-> 不改变结果。
+> 的 else 分支），本插件检测到同名工具已存在就什么都不做 —— 这种配置下上面三个开关都
+> 不改变结果，也不会去查 provider。
 
 ## 5. 如何确认它在工作
 
@@ -83,13 +89,20 @@
    - **AstrBot 4.23.0–4.26.7**：没有按插件调级别的入口。请把「配置 → 系统配置 →
      控制台日志级别」改成 DEBUG（配置键 `log_level`，`core/config/default.py`）——
      效果相同，但会影响全局输出，看完记得改回 INFO。
-3. **两条失败日志的含义**（都自带下一步动作）：
+3. **几条关键日志的含义**（都自带下一步动作）：
    - `[KBTool] 取不到内置工具 astr_kb_search（后续请求会自动重试）: ...`
      → 核心的内置工具注册表不可用（版本低于 4.23，或某个内置工具模块导入失败）。
      环境修好后下一个请求会自动恢复，不需要重装插件。
    - `[KBTool] 当前会话与主配置都没有可用知识库，已跳过注入工具；...`
      → 不是故障。插件只判断"配置是否非空"（不校验知识库是否存在/有内容）：要么去配置里
      选知识库，要么关掉本插件的 `only_when_kb_configured`。
+   - `[KBTool] 当前 provider「...」（模型 ...）的模型能力未勾选 tool_use，已跳过注入；...`
+     → 不是故障。这个 provider 的「模型能力」没勾「工具使用」，插件按你的配置尊重它。
+     去 WebUI 的 provider 设置里勾上「工具使用」；若模型其实支持、只是配置没勾，就关掉
+     本插件的 `respect_provider_tool_support`。同一 provider+model 只提醒一次。
+   - （DEBUG）`[KBTool] 无法判定当前 provider 是否支持工具调用（...），按支持处理。`
+     → 正常路径：`modalities` 未配置/格式非法/取不到 provider/读取失败时按支持处理
+     （fail-open）。默认 INFO 下不可见；同一个原因只记一条。
 4. **行为验证（最可靠）**：在对话里发「用知识库检索工具查一下 XXX」，
    模型这次的工具调用里出现 `astr_kb_search` 即为生效。
 
@@ -104,6 +117,19 @@
   "runner 不看工具列表"，不是"钩子不执行"。
 - **在面板里「停用」该内置工具不会阻止注入**：核心的 `get_builtin_tool()` 与工具集序列化
   都不看 `active`，`kb_agentic_mode = true` 的核心路径同理。
+- **`modalities` 的语义随核心版本翻转，所以只认一种否定信号**：`modalities=[]` 在 4.29.1
+  是「未配置，默认支持全部模态」（`tool_loop_agent_runner.py:665-669` 的注释与 `and modalities`
+  条件），在 4.24.5 / 4.23.0 却是「不支持」并会清空工具。本插件因此**只**把「非空 list 且
+  不含 `tool_use`」当否定信号，`None`／`[]`／缺键一律放行 —— 代价是 4.23 上 `[]` 仍可能被
+  核心清空后又被插件塞回去。这个差异还意味着：**`modalities=None` 在 4.23.0 会让核心
+  自己在构建期抛 `TypeError`**（发生在钩子之前），这不是插件能救的。
+- **4.23–4.26 没有 `get_using_provider_async()`**（4.27.5 才引入）：插件用 `getattr` 能力
+  探测后回退同步 `get_using_provider(umo=...)`。同步版内部走 `sp.get` 的专用同步 SQLite
+  连接做一次点查（实测约 1 ms，只阻塞调用线程、不碰 async 连接池），且只在 4.27.5 以下发生。
+  两方法都不存在时插件静默放行（照常注入，也不新增日志）。
+- **图片请求会按未知处理**：`req.image_urls` 非空且主 provider 的 `modalities` 不含 `image`
+  时，核心会把这次请求切给 fallback provider（`core/astr_main_agent.py:1412-1443`），
+  「当前 provider 不支持工具」就不再等于「这次请求的 provider 不支持工具」，插件按支持处理。
 - 知识库检索依赖外部 **embedding / rerank** 服务。网络慢时核心可能触发 120 秒工具超时
   （日志为 `tool astr_kb_search execution timeout after 120 seconds`），属环境问题。
 - 插件**不产生任何持久化数据**：不写文件、不建表、不改配置，因此重载/热重载都安全。
@@ -127,6 +153,9 @@ persona 里也不要再把知识库描述成目录树。
 
 - `kb_agentic_mode = true` 时核心自己也会加同名工具；本插件先 `get_tool()` 判重，
   已存在就什么都不做 —— 不会出现两个同名工具，也不会替换核心那个实例。
+- 0.2.1 起多了一步**只读**的能力判定：读「当前会话实际使用的 provider」的 `modalities`
+  （会话级 `selected_provider` 优先，与核心 `_select_provider` 同序），据此决定这次要不要
+  注入。只读，不改 provider、不改配置；关掉 `respect_provider_tool_support` 就完全跳过这一步。
 - 钩子 `priority = -310000`：核心按 priority 降序执行钩子，负数表示靠后，所以本插件排在
   普通插件（0）之后追加工具；但这**不保证绝对最后**。判重保护的是"我们不去覆盖别人"；
   "被别人覆盖"只能靠排在后面，而那并不保证。
@@ -136,10 +165,10 @@ persona 里也不要再把知识库描述成目录树。
 
 | AstrBot | 结论 |
 |---|---|
-| 4.23.0 | **支持**（声明下界）：`sp` / `ToolSet` / `get_config(umo=)` / `get_builtin_tool()` 均在，已在真实源码树上跑通 |
-| 4.24.5 / 4.25.6 / 4.26.8 / 4.27.5 | 本轮用到的公开面（`astrbot.api` 的 `ToolSet`/`sp`/`logger`）与注入位置已逐 tag 核对一致；未做端到端实跑 |
+| 4.23.0 | **支持**（声明下界）：`sp` / `ToolSet` / `get_config(umo=)` / `get_builtin_tool()` 均在；**没有 `get_using_provider_async()`**，0.2.1 的能力判定走同步 `get_using_provider` 回退，已在真实源码树上跑通 |
+| 4.24.5 / 4.25.6 / 4.26.8 / 4.27.5 | 用到的公开面与注入位置已逐 tag 核对一致；`get_using_provider_async()` 自 4.27.5 起存在（更早版本自动回退同步）；未做端到端实跑 |
 | 4.28.1 | **支持**，已在真实源码树上跑通 |
-| 4.29.1 | **支持**（当前生产版本），已在真实源码树上跑通 |
+| 4.29.1 | **支持**（当前生产版本），已在真实源码树上跑通（能力判定走 async 版） |
 
 ## 开发
 
@@ -157,7 +186,9 @@ python -m ruff format --check .
 
 `tests/contract_smoke.py` 在**真实核心**上验证：公开面导入、`star_map` 注册（删掉
 `@register` 后仍被识别）、钩子 `priority`、真实 `ProviderRequest` 注入与实例同一性、
-导入期无 `DeprecationWarning`。它**默认跳过**（缺 `ASTRBOT_SRC`），不影响上面的
+导入期无 `DeprecationWarning`，以及**版本差异**：真实 `Context` 到底有哪些 provider 查询
+方法（4.23–4.26 没有 `get_using_provider_async`），并按那个形状跑一次「`modalities=["text"]`
+→ 跳过 / `modalities=None` → 放行」。它**默认跳过**（缺 `ASTRBOT_SRC`），不影响上面的
 `pytest -q`；设置环境变量后单独跑：
 
 ```powershell

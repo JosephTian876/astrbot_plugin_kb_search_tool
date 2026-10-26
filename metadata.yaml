@@ -2,7 +2,7 @@ name: astrbot_plugin_kb_search_tool
 display_name: 知识库检索常驻
 desc: 让内置工具 astr_kb_search 常驻每次 LLM 请求；不改 kb_agentic_mode，因此知识库自动注入照常工作。
 short_desc: 让 astr_kb_search 工具始终可用
-version: 0.2.0
+version: 0.2.1
 author: JosephTian876
 repo: https://github.com/JosephTian876/astrbot_plugin_kb_search_tool
 astrbot_version: ">=4.23,<5"

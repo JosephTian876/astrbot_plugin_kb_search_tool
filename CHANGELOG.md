@@ -1,5 +1,85 @@
 # 更新日志
 
+## 0.2.1 - 2026-10-27
+
+注入前判定 provider 的工具能力。**默认开启**，新增 1 个配置键；关掉即逐字节回到 0.2.0。
+
+### 行为
+
+- 新增配置键 `respect_provider_tool_support`（默认 `true`）：在
+  `enabled → 工具解析 → 同名判重 → 知识库判定` **之后**、真正 `add_tool` **之前**，读一次
+  「当前会话实际使用的 provider」的「模型能力（`modalities`）」。
+  - **只有** `modalities` 是「非空 list 且不含 `tool_use`」时才跳过注入，并 WARNING 一次
+    （每 provider+model 一次）。判据与核心 `_func_tool_for_provider` 逐字对齐
+    （4.29.1 `core/agent/runners/tool_loop_agent_runner.py:680-686`）。
+  - `modalities` 为 `None`／`[]`／缺键／非 list，或取不到 provider、`provider_config` 不是
+    dict、读取抛异常 —— 一律按「支持」处理、照常注入；这些「未知」路径只在 DEBUG 留一条
+    （按原因去重），绝不 ERROR 刷屏。理由：核心 4.29 自己把空值当「未配置，默认支持全部
+    模态」（同文件 `:665-669`），把空值当否定信号会让绝大多数没填「模型能力」的用户直接
+    失去工具。
+  - 图片请求（`req.image_urls` 非空）且主 provider 没有 `image` 模态时，核心会把这次请求切给
+    fallback provider（`core/astr_main_agent.py:1412-1443`），能力不再是「当前 provider」，
+    因此按未知处理、照常注入。
+  - 会话级 `selected_provider`（WebUI / 开放 API 选模型）优先于会话默认 provider，与核心
+    `_select_provider` 同序（`core/astr_main_agent.py:283-310`）。
+- 判定**只读**：不改 `modalities`、不改 `selected_provider`、不写任何配置、不 monkeypatch。
+- 开关关闭 == 0.2.0：142 个场景（2 种知识库 × 5 种 `func_tool` × 7 种 provider 形态 ×
+  有无图片 + 2 种会话级知识库）下，与 `git show f149e10:main.py`（SHA256 与生产安装目录
+  一致）的观测 JSON **SHA256 完全相同**（`B5A28FCA…B3141F3`）。开关开启时 37 个场景观测
+  不同，其中**只有 4 个真的少掉工具**（`modalities=["text"]` + 无图片 + 有知识库；3 个是
+  请求本来没有/只有别的工具，1 个是会话级知识库）：其余 27 个注入结果不变、只多一条
+  DEBUG，6 个只多一次不可见的 provider 查询。
+
+### 兼容
+
+- `get_using_provider_async()` 是 **4.27.5** 才有的 API；本插件声明 `>=4.23`
+  （`metadata.yaml`），因此做 `getattr` 能力探测并回退到 4.23–4.26 的同步
+  `get_using_provider(umo=...)`；两者都没有时**静默**放行（不新增日志，保持 0.2.0 的
+  成功路径只留 1 条 DEBUG）。真实 4.23.0 源码树的契约冒烟输出：
+  `provider_api={async:false, sync:true, by_id:true}`、
+  `provider_gate={modalities_text:skip, modalities_none:inject, via:sync}`；
+  4.29.1：`async:true`、`via:async`。
+- 同步回退走 `sp.get` 的专用同步 SQLite 连接（一次点查，实测约 1 ms，只阻塞调用线程、
+  不碰 async 连接池），且只在 4.27.5 以下发生；4.27.5+ 走 async 版。
+
+### 日志
+
+- 新增 WARNING（每个 provider+model 一次）：
+  `[KBTool] 当前 provider「<id>」（模型 <model>）的模型能力未勾选 tool_use，已跳过注入；如需强制注入请关闭 respect_provider_tool_support。`
+- 新增 DEBUG（未知原因，按原因去重、每插件生命周期一次）：
+  `[KBTool] 无法判定当前 provider 是否支持工具调用（<原因>），按支持处理。`
+- 启动 INFO 与「注入成功」DEBUG 不变（`test_01` 仍断言成功路径恰好 1 条 DEBUG）。
+
+### 配置与文档
+
+- `_conf_schema.json` 新增 `respect_provider_tool_support`（`bool`，默认 `true`，hint 写明
+  判据是「`modalities` 非空且不含 `tool_use`」、未知/空值一律放行、关闭后回到旧行为）。
+- README：配置表新增一行；「自查」补两条日志的含义；「边界」补 `modalities` 的跨版本语义、
+  4.23–4.26 的同步回退、图片 fallback；「与核心的关系」「版本兼容」同步。
+
+### 测试
+
+- 单测 **15 → 56**（+41）：`AUDIT-KB.md` §3.2 判定表逐行覆盖 —— `modalities` 的 7 种形态
+  （缺键/`None`/`[]`/字符串/dict/tuple/int）、取不到 provider、非聊天 provider、
+  `ValueError` 路径、探测抛异常、旧版 Context 只有同步 API、Context 完全没有 provider API
+  （静默）、`selected_provider` 三种走向、图片 fallback 三种组合、关掉知识库闸门仍注入、
+  开关关闭、配置键 1:1。
+- 契约冒烟新增两条真树断言（`Context` 的 provider 方法面；按该形状跑跳过/放行），
+  4.29.1 与 4.23.0 均通过。
+- `pytest -q` / `python -m compileall` / `uvx --from ruff==0.15.22 ruff check .` /
+  `ruff format --check .` 全绿。
+
+### 已知边界（明确不修）
+
+- **「配置 ≠ 真实能力」**：`modalities` 是用户手填的；模型其实支持函数调用、只是没勾
+  `tool_use` 时会被跳过（WARNING 会指出来）。这是「尊重配置」的固有代价，关掉开关即可恢复。
+- **4.23.0 的 `modalities=[]`**：核心当「不支持」并清空，本插件按「未配置」放行 —— 同一
+  配置值跨版本语义翻转，无法两全；4.23 用户请显式勾 `tool_use` 或升级。`modalities=None`
+  在 4.23.0 会让核心自己在构建期抛 `TypeError`（发生在钩子之前），插件无法救。
+- **非标准 `func_tool`**（别的插件换成缺 `get_tool` 的对象）仍是 0.2.0 的行为：ERROR 一次 +
+  不注入。本轮刻意不加防御，否则「开关关闭时逐字节等价 0.2.0」不成立（`AUDIT-KB.md` §7
+  第 6 行把这条列为「不修」）。
+
 ## 0.2.0 - 2026-10-26
 
 行为修正 + 可维护性加固。**配置键不变，无需迁移。**
