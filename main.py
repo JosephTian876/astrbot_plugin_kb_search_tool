@@ -19,8 +19,8 @@ KB_TOOL_NAME = "astr_kb_search"
 
 #: 核心按 priority 降序执行钩子（``core/star/star_handler.py``：
 #: ``sort(key=lambda h: -h.extras_configs["priority"])``），数值越大越先、负数越晚，
-#: 所以取足够小的负数让自己排在普通插件（0）之后，但这**不保证绝对最后**；
-#: "不被同名工具覆盖"靠的是下面先用 ``get_tool`` 判重（``ToolSet.add_tool`` 对同名是覆盖语义）。
+#: 所以取足够小的负数让自己排在普通插件（0）之后，但这**不保证绝对最后**。
+#: 判重保护的是"我们不去覆盖别人"；被别人覆盖只能靠排在后面，而这一点并不保证。
 HOOK_PRIORITY = -310000
 
 
@@ -83,7 +83,9 @@ class KBSearchToolPlugin(Star):
             req.func_tool = ToolSet()  # type: ignore[attr-defined]
             tool_set = req.func_tool
         tool_set.add_tool(tool)
-        logger.debug("[KBTool] 注入 %s，工具数=%d", KB_TOOL_NAME, len(tool_set.tools))
+        # 日志取值也不假设一定有 ``tools``：func_tool 可能被别的插件换成自定义对象。
+        tool_count = len(getattr(tool_set, "tools", ()))
+        logger.debug("[KBTool] 注入 %s，工具数=%d", KB_TOOL_NAME, tool_count)
 
     def _resolve_tool(self) -> FunctionTool | None:
         """取核心内置工具实例，成功即缓存。
