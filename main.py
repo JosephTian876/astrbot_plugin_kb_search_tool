@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from astrbot.api import FunctionTool, ToolSet, logger
+from astrbot.api import FunctionTool, ToolSet, logger, sp
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 
@@ -51,13 +51,13 @@ class KBSearchToolPlugin(Star):
         # req 是核心的 ProviderRequest，但它不在 astrbot.api 公开面里，故只按鸭子类型用；
         # 这里必须 fail-open：注入失败最坏只是模型少一个工具，绝不能打断正常对话。
         try:
-            await self._ensure_tool(req)
+            await self._ensure_tool(event, req)
         except Exception as exc:  # noqa: BLE001 - 异常类型不可预期
             logger.error(
                 "[KBTool] 注入工具时异常，已跳过本次注入: %s", exc, exc_info=True
             )
 
-    async def _ensure_tool(self, req: object) -> None:
+    async def _ensure_tool(self, event: AstrMessageEvent, req: object) -> None:
         if not self.enabled:  # 关闭时彻底不介入，痕迹只有启动那行"启用=False"
             return
 
@@ -70,11 +70,11 @@ class KBSearchToolPlugin(Star):
             # 核心 agentic 模式或别的钩子已加过：不重复添加，也不替换别人的实例。
             return
 
-        if self.only_when_kb_configured and not self._kb_configured():
+        if self.only_when_kb_configured and not await self._kb_available(event):
             if not self._warned_no_kb:
                 self._warned_no_kb = True
                 logger.warning(
-                    "[KBTool] 主配置里没有知识库（kb_names 为空），已跳过注入工具；"
+                    "[KBTool] 当前会话与主配置都没有可用知识库，已跳过注入工具；"
                     "如需强制注入请关闭 only_when_kb_configured。"
                 )
             return
@@ -109,14 +109,21 @@ class KBSearchToolPlugin(Star):
             return None
         return self._tool
 
-    def _kb_configured(self) -> bool:
-        """主配置（``kb_names``）里是否有知识库。
+    async def _kb_available(self, event: AstrMessageEvent) -> bool:
+        """当前会话有没有可用知识库，判定顺序与核心 ``retrieve_knowledge_base`` 一致。
 
-        读不到配置时返回 True（fail-open）：多注入一个工具最多让模型多一次无效调用，
-        而"判定失败就不注入"会让插件在任何配置异常下整体失效。
+        核心先看会话级 ``kb_config.kb_ids``，没有该键才回落到主配置 ``kb_names``
+        （``core/tools/knowledge_base_tools.py``）。不镜像会两头出错：只配会话级知识库的会话
+        被拒绝注入，会话里显式关掉知识库（``kb_ids=[]``）却仍注入。异常一律返回 True
+        （fail-open）：多注入最多多一次无效调用，判定失败就不注入则会让插件整体失效。
         """
         try:
-            return bool(self.context.get_config().get("kb_names") or [])
+            umo = event.unified_msg_origin
+            session_cfg = await sp.session_get(umo, "kb_config", default={})
+            if isinstance(session_cfg, dict) and "kb_ids" in session_cfg:
+                return bool(session_cfg.get("kb_ids"))
+            return bool(self.context.get_config(umo=umo).get("kb_names") or [])
         except Exception as exc:  # noqa: BLE001 - 见 docstring 的 fail-open
+            # 用 debug 而非 warning：持续失败会每请求一条；排障时把插件日志调到 DEBUG 即可。
             logger.debug("[KBTool] 判定知识库可用性失败，按可用处理: %s", exc)
             return True
