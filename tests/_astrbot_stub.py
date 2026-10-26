@@ -140,11 +140,11 @@ class _Filter:
     """``astrbot.api.event.filter`` 的最小替身。"""
 
     def __init__(self) -> None:
-        #: 记录钩子注册时拿到的 priority，用于钉住 ``HOOK_PRIORITY`` 真的被传下去。
-        self.on_llm_request_priorities: list[int | None] = []
+        #: 每次钩子注册时收到的**完整 kwargs**（钉住关键字名，而不只是它的值）。
+        self.on_llm_request_kwargs: list[dict[str, object]] = []
 
     def on_llm_request(self, **kwargs):
-        self.on_llm_request_priorities.append(kwargs.get("priority"))
+        self.on_llm_request_kwargs.append(kwargs)
 
         def decorator(func):
             return func

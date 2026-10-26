@@ -15,6 +15,7 @@ import re
 import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
 import _astrbot_stub as stub
@@ -91,9 +92,7 @@ def messages(logs, level: int) -> list[str]:
     return [record.getMessage() for record in logs if record.levelno == level]
 
 
-def test_01_injects_the_core_builtin_instance(
-    plugin_module, hook, logs, hook_priorities
-):
+def test_01_injects_the_core_builtin_instance(plugin_module, hook, logs, hook_kwargs):
     """有知识库 → 注入，且注入的就是核心缓存的那个实例；成功注入留一条 DEBUG。"""
     plugin, manager, context, tool = make_plugin(plugin_module, kb_names=["kb1"])
 
@@ -106,8 +105,8 @@ def test_01_injects_the_core_builtin_instance(
     assert manager.calls == 1, "启动解析一次，请求期应命中缓存"
     assert context.config_umos == ["aiocqhttp:FriendMessage:10086"], "主配置要按会话取"
 
-    # 钩子注册必须带上 HOOK_PRIORITY，否则"排在普通插件之后"这个前提不成立。
-    assert hook_priorities == [plugin_module.HOOK_PRIORITY]
+    # 钩子注册必须用关键字 priority=HOOK_PRIORITY：钉住**关键字名**，不只是值。
+    assert hook_kwargs == [{"priority": plugin_module.HOOK_PRIORITY}]
 
     # 启动只有一行 INFO（不含版本号：核心在同一屏已经打过）；注入成功只在 DEBUG 留痕。
     assert len(messages(logs, logging.INFO)) == 1
@@ -266,7 +265,13 @@ def test_10_conf_schema_and_metadata_are_valid():
         )
     assert "description" not in metadata, "description 是核心从不读取的死字段（FIX-5）"
     assert re.fullmatch(r"\d+\.\d+\.\d+", metadata["version"]), "version 必须是 SemVer"
-    assert metadata["astrbot_version"].startswith(">=")
+
+    # 核心用 packaging 的 SpecifierSet 校验 astrbot_version（star_manager.py 的
+    # PLUGIN_VERSION 检查）；这里用同一个解析器，钉住"能被解析"且"真的包含下界"。
+    specifiers = pytest.importorskip("packaging.specifiers")
+    spec = specifiers.SpecifierSet(metadata["astrbot_version"])
+    assert spec.contains("4.23.0"), "声明下界必须包含 4.23.0"
+    assert not spec.contains("4.22.3"), "低于下界的 4.22.x 不该被声明为支持"
 
 
 def test_11_fail_open_when_session_get_raises(plugin_module, hook, sp):
@@ -326,3 +331,24 @@ def test_14_stub_toolset_matches_core_active_semantics():
     tool_set.tools[0].active = False
     tool_set.add_tool(inactive_tool)
     assert tool_set.get_tool("astr_kb_search") is inactive_tool
+
+
+def test_15_non_dict_session_config_falls_back_to_global(plugin_module, hook, sp):
+    """``sp.session_get`` 返回非 dict → 回落主配置，不抛、也不当会话级配置。
+
+    核心的分支条件是 ``if session_config and "kb_ids" in session_config``；插件用
+    ``isinstance(session_cfg, dict)`` 做同样的判断。这条钉住"历史数据写坏/别的插件塞了
+    奇怪值"时判定既不抛异常，也不会被误当成会话级配置。
+    """
+    umo = "aiocqhttp:FriendMessage:10086"
+    plugin, _, context, tool = make_plugin(plugin_module, kb_names=["kb1"])
+
+    for bad_value in (["x"], "str", 123, {"top_k": 5}):
+        sp.session[(umo, "kb_config")] = bad_value
+        req = stub.ProviderRequest()
+        hook(plugin, req)
+        assert req.func_tool is not None, f"{bad_value!r} 应回落到主配置并注入"
+        assert req.func_tool.get_tool(plugin_module.KB_TOOL_NAME) is tool
+
+    # 每次都读了主配置 → 确实走了 kb_names 兜底，而不是被当成会话级配置短路。
+    assert context.config_umos == [umo] * 4

@@ -66,9 +66,9 @@ def plugin_module():
 
 
 @pytest.fixture
-def hook_priorities():
-    """模块导入时钩子注册拿到的 priority 列表（注册只发生一次）。"""
-    return FILTER.on_llm_request_priorities
+def hook_kwargs():
+    """模块导入时钩子注册收到的完整 kwargs 列表（注册只发生一次）。"""
+    return FILTER.on_llm_request_kwargs
 
 
 @pytest.fixture
