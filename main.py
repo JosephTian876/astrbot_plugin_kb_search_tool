@@ -1,89 +1,29 @@
 """知识库检索常驻 —— 让 ``astr_kb_search`` 工具始终可用。
 
-## 解决的问题
-
-AstrBot 核心的 ``astr_main_agent._apply_kb()`` 是 **if/else 二选一**：
-
-```python
-if not config.kb_agentic_mode:
-    if req.prompt is None or not req.prompt.strip():
-        return                      # ← 纯附件消息（如只发视频）直接跳过
-    ... 自动把 KB 结果注入 extra_user_content_parts
-else:
-    req.func_tool.add_tool(KnowledgeBaseQueryTool)   # ← 给工具，但不再自动注入
-```
-
-于是运营者面临两难：
-
-- ``kb_agentic_mode=false``：有文字时自动注入 ✅，但**模型手上没有查知识库的工具** ❌
-- ``kb_agentic_mode=true``：有工具 ✅，但**失去自动注入** ❌
-
-## 本插件的做法
-
-在 ``on_llm_request`` 阶段直接把 ``astr_kb_search`` 塞进 ``req.func_tool``，
-**不碰 ``kb_agentic_mode``** —— 于是两者兼得：
-
-- ✅ 自动注入照常工作（保持 ``kb_agentic_mode=false``）
-- ✅ 模型始终有 ``astr_kb_search`` 可用
-
-## 为什么这很重要（实测教训）
-
-某部署的 persona 里写着「先查知识库再回答」，并把知识库描述成一个**文件夹树**
-（``冬马和纱知识库_TE/``、``70_附录_边界速查`` …）却没给路径、也没给工具。
-而 ``kb_agentic_mode=false`` 让 ``astr_kb_search`` 未注册 ——
-
-**结果：模型把「查知识库」理解成「搜磁盘」**，用 ``astrbot_execute_python`` +
-``os.walk`` 扫遍 ``C:\\`` 与 ``D:\\``，跑满 30 步工具调用、耗时 12 分钟才回复。
-同一现象连续复现三次（04:23 / 05:04 / 06:22）。
-
-有了本插件，persona 说「查知识库」时模型就有对应的工具可用，不必碰文件系统。
+做什么：在 ``on_llm_request`` 里把核心内置工具 ``astr_kb_search`` 追加进本次请求的
+``func_tool``，于是 ``kb_agentic_mode=false``（只有自动注入、模型没有工具）时它也有了。
+不做什么：不改 ``kb_agentic_mode``、不碰核心的自动注入、不改工具实现、不 monkeypatch。
+前提：内置 Agent（``runner_type=local``）+ provider 支持函数调用；插件无资源需清理。
+背景、适用范围与排查方法见 ``README.md``。
 """
 
 from __future__ import annotations
 
-from astrbot.api import logger
+from astrbot.api import FunctionTool, ToolSet, logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star
 
-try:
-    from astrbot.core.agent.tool import ToolSet
-except Exception:  # pragma: no cover - 版本差异兜底
-    ToolSet = None  # type: ignore[assignment]
-
-PLUGIN_NAME = "astrbot_plugin_kb_search_tool"
-PLUGIN_REPO = "https://github.com/JosephTian876/astrbot_plugin_kb_search_tool"
-
-
-def _read_plugin_version() -> str:
-    """从 metadata.yaml 读取版本号，避免与发布版本脱节。"""
-    try:
-        from pathlib import Path
-
-        text = (Path(__file__).parent / "metadata.yaml").read_text(encoding="utf-8")
-        for line in text.splitlines():
-            if line.startswith("version:"):
-                return line.split(":", 1)[1].strip().strip("\"'")
-    except Exception:  # noqa: BLE001 - 读不到就用占位值，不影响功能
-        pass
-    return "unknown"
-
-
-PLUGIN_VERSION = _read_plugin_version()
-
-#: 核心工具名。核心在 agentic 模式下也注册同名工具，本插件复用同一个实例。
+#: 核心内置工具名。``kb_agentic_mode=true`` 时核心注册的是同一个类的同一个实例，
+#: 本插件只是把它交给模型，所以不会出现第二份实现。
 KB_TOOL_NAME = "astr_kb_search"
 
-#: 比其他插件都晚执行，确保我们追加的工具不会被后续钩子覆盖掉。
+#: 核心按 priority 降序执行钩子（``core/star/star_handler.py``：
+#: ``sort(key=lambda h: -h.extras_configs["priority"])``），数值越大越先、负数越晚，
+#: 所以取足够小的负数让自己排在普通插件（0）之后，但这**不保证绝对最后**；
+#: "不被同名工具覆盖"靠的是下面先用 ``get_tool`` 判重（``ToolSet.add_tool`` 对同名是覆盖语义）。
 HOOK_PRIORITY = -310000
 
 
-@register(
-    PLUGIN_NAME,
-    "JosephTian876",
-    "让 astr_kb_search 工具始终可用，同时保留知识库自动注入 —— 核心的 kb_agentic_mode 二选一做不到。",
-    PLUGIN_VERSION,
-    PLUGIN_REPO,
-)
 class KBSearchToolPlugin(Star):
     """把内置的知识库检索工具常驻到每次 LLM 请求。"""
 
@@ -94,77 +34,89 @@ class KBSearchToolPlugin(Star):
         self.only_when_kb_configured: bool = bool(
             raw.get("only_when_kb_configured", True)
         )
-        self._warned: set[str] = set()
+        #: 缓存的核心工具实例；``None`` = 上次没取到，下个请求会再试（自愈）。
+        self._tool: FunctionTool | None = None
+        # 两个"只报一次"的标记：取工具失败、无知识库。默认配置下每请求都会命中，逐次打会刷屏。
+        self._resolve_failed = False
+        self._warned_no_kb = False
 
-        # 启动自检：确认核心工具确实注册了
-        self.tool_available = False
-        try:
-            self.context.get_llm_tool_manager().get_builtin_tool(KB_TOOL_NAME)
-            self.tool_available = True
-        except Exception as exc:  # noqa: BLE001
-            logger.error(
-                "[KBTool] 无法取得内置工具 %s，插件不会生效: %s", KB_TOOL_NAME, exc
-            )
-
-        if self.tool_available:
-            logger.info(
-                "[KBTool] v%s 已加载 | 启用=%s | 工具=%s 已确认可用",
-                PLUGIN_VERSION,
-                self.enabled,
-                KB_TOOL_NAME,
-            )
-        logger.info(
-            "[KBTool] 提示：本插件让模型始终能调用 %s。"
-            "可保持 kb_agentic_mode=false 以同时享受知识库自动注入。",
-            KB_TOOL_NAME,
-        )
+        logger.info("[KBTool] 已加载 | 启用=%s | 工具=%s", self.enabled, KB_TOOL_NAME)
+        # 启动即解析一次，让"核心没注册该工具"当场暴露，而不是等第一个请求静默不注入。
+        # 放在 INFO 之后：故障时日志最后一行是 ERROR，不会被"宣示成功"盖住。
+        self._resolve_tool()
 
     @filter.on_llm_request(priority=HOOK_PRIORITY)
     async def on_llm_request(self, event: AstrMessageEvent, req: object) -> None:
         """确保本次请求的工具集中含有 astr_kb_search。"""
+        # req 是核心的 ProviderRequest，但它不在 astrbot.api 公开面里，故只按鸭子类型用；
+        # 这里必须 fail-open：注入失败最坏只是模型少一个工具，绝不能打断正常对话。
         try:
             await self._ensure_tool(req)
-        except Exception as exc:  # noqa: BLE001
-            # 绝不因为本插件打断正常对话
-            logger.error("[KBTool] 注入工具时异常，已跳过: %s", exc, exc_info=True)
+        except Exception as exc:  # noqa: BLE001 - 异常类型不可预期
+            logger.error(
+                "[KBTool] 注入工具时异常，已跳过本次注入: %s", exc, exc_info=True
+            )
 
     async def _ensure_tool(self, req: object) -> None:
-        if not self.enabled or not self.tool_available or ToolSet is None:
+        if not self.enabled:  # 关闭时彻底不介入，痕迹只有启动那行"启用=False"
             return
 
-        # 已有（核心 agentic 模式已加过，或前一个钩子加过）就不重复
+        tool = self._resolve_tool()
+        if tool is None:
+            return  # 原因与补救办法已由 _resolve_tool 打过一次
+
         tool_set = getattr(req, "func_tool", None)
         if tool_set is not None and tool_set.get_tool(KB_TOOL_NAME) is not None:
+            # 核心 agentic 模式或别的钩子已加过：不重复添加，也不替换别人的实例。
             return
 
         if self.only_when_kb_configured and not self._kb_configured():
-            key = "no-kb"
-            if key not in self._warned:
-                self._warned.add(key)
+            if not self._warned_no_kb:
+                self._warned_no_kb = True
                 logger.warning(
-                    "[KBTool] 未配置任何知识库（kb_names 为空），已跳过注入工具。"
-                    "如需强制注入，可关闭插件配置里的 only_when_kb_configured。"
+                    "[KBTool] 主配置里没有知识库（kb_names 为空），已跳过注入工具；"
+                    "如需强制注入请关闭 only_when_kb_configured。"
                 )
             return
 
-        tool = self.context.get_llm_tool_manager().get_builtin_tool(KB_TOOL_NAME)
-
-        if tool_set is None:
+        if tool_set is None:  # 纯对话没有别的工具时核心给的就是 None，不新建等于缺席
             req.func_tool = ToolSet()  # type: ignore[attr-defined]
             tool_set = req.func_tool
         tool_set.add_tool(tool)
+        logger.debug("[KBTool] 注入 %s，工具数=%d", KB_TOOL_NAME, len(tool_set.tools))
+
+    def _resolve_tool(self) -> FunctionTool | None:
+        """取核心内置工具实例，成功即缓存。
+
+        失败时**不**永久停用自己：``get_builtin_tool`` 会顺带导入全部内置工具模块，任一模块
+        导入失败都会让启动瞬间取不到工具；环境修好后应当自愈，而不是整个进程寿命内静默失效。
+        """
+        if self._tool is not None:
+            return self._tool
+        try:
+            self._tool = self.context.get_llm_tool_manager().get_builtin_tool(
+                KB_TOOL_NAME
+            )
+        except Exception as exc:  # noqa: BLE001 - 核心注册表的异常类型不可预期
+            if not self._resolve_failed:
+                self._resolve_failed = True
+                logger.error(
+                    "[KBTool] 取不到内置工具 %s（后续请求会自动重试）: %s；"
+                    "请确认 AstrBot >= 4.23 且核心内置工具可正常导入。",
+                    KB_TOOL_NAME,
+                    exc,
+                )
+            return None
+        return self._tool
 
     def _kb_configured(self) -> bool:
-        """检查是否真的配置了知识库。"""
-        try:
-            cfg = self.context.get_config()
-            names = cfg.get("kb_names") or []
-            if not names:
-                return False
-            return True
-        except Exception:  # noqa: BLE001
-            # 读不到配置就不拦，交给核心处理
-            return True
+        """主配置（``kb_names``）里是否有知识库。
 
-    async def terminate(self) -> None:
-        logger.info("[KBTool] 插件已终止")
+        读不到配置时返回 True（fail-open）：多注入一个工具最多让模型多一次无效调用，
+        而"判定失败就不注入"会让插件在任何配置异常下整体失效。
+        """
+        try:
+            return bool(self.context.get_config().get("kb_names") or [])
+        except Exception as exc:  # noqa: BLE001 - 见 docstring 的 fail-open
+            logger.debug("[KBTool] 判定知识库可用性失败，按可用处理: %s", exc)
+            return True
