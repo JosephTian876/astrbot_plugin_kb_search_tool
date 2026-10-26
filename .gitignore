@@ -15,3 +15,8 @@ __pycache__/
 config.local.yaml
 .env
 *.log
+
+# 在仓库根目录 `import astrbot` 时，AstrBot 会把当前工作目录当成 root，凭空建出
+# data/ 并写入 cmd_config.json（AstrBot 主配置，可能含 API 密钥与管理员 QQ 号）。
+# 测试已改用 tests/_astrbot_stub.py 的替身，这条是给手工验证脚本兜底的。
+data/
