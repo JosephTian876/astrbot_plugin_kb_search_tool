@@ -313,9 +313,11 @@ class KBSearchToolPlugin(Star):
                 )
             self._warn_unsupported_once(provider, config)
             return False
-        except Exception as exc:  # noqa: BLE001 - 探测失败必须 fail-open（AUDIT-KB §3.6）
+        except Exception as exc:  # noqa: BLE001 - 探测失败必须 fail-open
+            # fail-open 的理由：读不到 provider 只说明"不知道"，不说明"不支持"。按否定信号
+            # 处理会让一次数据库抖动变成整段对话失去工具，而多注入最多多一次无效调用。
             # 去重键 = 类型 + 消息前 80 字：只按类型去重时，"同类型不同原因"只留第一条，
-            # 排障时看不到真正的原因（VERIFY-KB-R3 §9 P3-1）。截断保证键不会无限长。
+            # 排障时看不到真正的原因。截断保证键不会无限长。
             return self._assume_supported(
                 f"exc:{type(exc).__name__}:{str(exc)[:80]}",
                 f"{type(exc).__name__}: {exc}",

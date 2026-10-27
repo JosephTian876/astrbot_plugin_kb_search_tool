@@ -20,3 +20,12 @@ config.local.yaml
 # data/ 并写入 cmd_config.json（AstrBot 主配置，可能含 API 密钥与管理员 QQ 号）。
 # 测试已改用 tests/_astrbot_stub.py 的替身，这条是给手工验证脚本兜底的。
 data/
+
+# 审计/实现/架构过程文档：**不进仓库**。
+# 它们天然含真实 QQ 群号/好友号、生产 provider 清单与会话偏好等运维细节，而本仓库会随
+# 插件市场被 `git clone` 到每个用户机器上。过程流水账留在仓库外
+# （`work\kb-030-artifacts\`），面向用户的结论压缩进 README/CHANGELOG。
+AUDIT-*.md
+IMPL-*.md
+ARCH-*.md
+VERIFY-*.md

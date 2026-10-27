@@ -1,19 +1,23 @@
 """契约冒烟：在**真实 AstrBot 源码**上验证插件对核心的每一条假设。
 
 默认不跑 —— 普通 ``pytest -q`` 在收集阶段就会跳过它（缺 ``ASTRBOT_SRC``），既不拖慢
-也不污染那套脱网测试。要跑它需要一份 AstrBot 源码树：
+也不污染那套脱网测试。要跑它需要一份 AstrBot 源码树（**任何** AstrBot 源码树都行，
+不需要是当前生产版本；``ASTRBOT_SRC`` 指到的是**包含** ``astrbot/`` 包的那一层目录）：
 
 ```powershell
-$py = 'D:\\UwU\\Documents\\dshworkdir\\AstrBot\\.venv\\Scripts\\python.exe'
-
 # 4.29.1（生产源码，只读）
-$env:ASTRBOT_SRC = 'D:\\AstrBot\\backend\\app'
-& $py -m pytest tests/contract_smoke.py -q
+$env:ASTRBOT_SRC = '<AstrBot 源码树>'          # 例如 …/backend/app
+& python -m pytest tests/contract_smoke.py -q
 
 # 4.23.0（声明下界；git archive v4.23.0 astrbot | tar -x 导出的树）
 $env:ASTRBOT_SRC = '<导出目录>'
-& $py -m pytest tests/contract_smoke.py -q
+& python -m pytest tests/contract_smoke.py -q
 ```
+
+**这个"绿"必须是有意义的**：父测试会把子进程输出里的 evidence JSON 抠出来，断言
+``astrbot.__file__`` 反查出的包路径**确实位于 ``ASTRBOT_SRC`` 之下**（并把
+``provider_api`` / ``provider_gate`` 也核对一遍）。否则 ``ASTRBOT_SRC`` 指错目录时
+子进程会静默回落到 venv 里已安装的 AstrBot，测试仍报绿——那是一个证明不了任何事的绿。
 
 为什么要走子进程：pytest 进程的 ``conftest`` 已经把 ``astrbot`` 换成了替身（写进
 ``sys.modules``），在本进程里再 import 真实核心只会拿到替身。子进程从零导入，才是
@@ -46,6 +50,8 @@ import tempfile
 from pathlib import Path
 
 import pytest
+
+from _contract_evidence import assert_evidence_matches, extract_evidence
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ASTRBOT_SRC = os.environ.get("ASTRBOT_SRC", "").strip()
@@ -254,6 +260,13 @@ def test_contract_against_real_astrbot_core() -> None:
         f"真实核心契约冒烟失败（ASTRBOT_SRC={ASTRBOT_SRC}）\n{output}"
     )
     assert "CONTRACT_OK" in output, f"子进程没有打出 CONTRACT_OK\n{output}"
+
+    # 关键一步：退出码 0 + CONTRACT_OK **不足以**说明测到了你指定的树。子进程做的是
+    # ``sys.path.insert(0, ASTRBOT_SRC)`` 后 ``import astrbot``，ASTRBOT_SRC 指错目录时会
+    # 静默回落到 venv 里已安装的 AstrBot（实测：指向空目录仍 1 passed）。这里用
+    # ``astrbot.__file__`` 反查包路径，要求它确实落在 ASTRBOT_SRC 之下。
+    evidence = extract_evidence(output)
+    assert_evidence_matches(evidence, ASTRBOT_SRC)
 
 
 if __name__ == "__main__":

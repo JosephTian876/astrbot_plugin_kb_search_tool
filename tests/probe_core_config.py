@@ -9,7 +9,8 @@
   → 用户的"关掉"被静默反转。这一半是本轮修复的主体，与核心无关。
 
 只写 ``ASTRBOT_ROOT`` 下的临时目录，不碰生产 ``data/``。
-用法：``PROBE_SRC=<astrbot 源码树> python kb-r4-probe-cfg.py``
+用法：``PROBE_SRC=<astrbot 源码树> python tests/probe_core_config.py``
+（``PROBE_SRC`` 必填：指到**包含** ``astrbot/`` 包的那一层目录；本文件不含任何本机绝对路径。）
 """
 
 from __future__ import annotations
@@ -20,14 +21,43 @@ import sys
 import tempfile
 from pathlib import Path
 
-REPO = Path(r"D:\UwU\Documents\dshworkdir\work\kb-030")
+#: 仓库根由本文件位置反推（与 ``conftest.py`` / ``test_docs.py`` 同一写法），
+#: 这样换机器/换克隆目录都不用改代码。
+REPO = Path(__file__).resolve().parent.parent
 
-SRC = os.environ.get("PROBE_SRC", r"D:\AstrBot\backend\app")
+SRC = os.environ.get("PROBE_SRC", "").strip()
+if not SRC:
+    print(
+        "缺少 PROBE_SRC。用法：\n"
+        "    PROBE_SRC=<包含 astrbot/ 包的那一层目录> python tests/probe_core_config.py\n"
+        "例如（PowerShell）：\n"
+        "    $env:PROBE_SRC = '<AstrBot 源码树>'; python tests/probe_core_config.py",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+if not (Path(SRC) / "astrbot").is_dir():
+    print(
+        f"PROBE_SRC={SRC} 下没有 astrbot/ 子目录；它应当是**包含** astrbot/ 包的那一层"
+        "（例如 <AstrBot 仓库>/backend/app，而不是 …/backend/app/astrbot）。",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
 os.environ["ASTRBOT_ROOT"] = tempfile.mkdtemp(prefix="kb_r4_cfg_")
 sys.path.insert(0, SRC)
 
 import astrbot  # noqa: E402
 from astrbot.core.config.astrbot_config import AstrBotConfig  # noqa: E402
+
+#: 与契约冒烟同一条防"假绿"断言：`sys.path.insert` 之后若 SRC 里没有包，Python 会**静默**
+#: 回落到已安装的 AstrBot，探针就在别人的版本上跑完还打印"结论"。
+_package = Path(astrbot.__file__).resolve().parent
+if not str(_package).startswith(str(Path(SRC).resolve()) + os.sep):
+    print(
+        f"实际导入的 astrbot 是 {_package}，不在 PROBE_SRC={SRC} 之下；"
+        "本次探针测的不是你指定的树，结论无效。",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
 
 print("astrbot:", getattr(astrbot, "__version__", "<no __version__>"), "| src:", SRC)
 print("root:", os.environ["ASTRBOT_ROOT"])

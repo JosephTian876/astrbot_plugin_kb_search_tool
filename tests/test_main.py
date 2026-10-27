@@ -3,7 +3,8 @@
 用例 01–10 对应 SYNTHESIS FIX-7 的清单（其中 03 是 FIX-1「会话级知识库」的回归钉），
 11–12 是 FIX-1 验收要求的 fail-open 两个变体，13 是"只依赖 ``astrbot.api`` 公开面"的结构钉。
 16–30 是 provider 工具能力判定（``respect_provider_tool_support``）的判定表 —— 逐行对齐
-``AUDIT-KB.md`` §3.2；其中 29 是"开关关闭 == 0.2.0"的等价性钉子。
+README §4 与 ``main.py`` 里 ``_provider_tool_support`` 的 docstring；其中 29 是"开关关闭 ==
+0.2.0"的等价性钉子。
 
 所有用例都走**真实入口** ``on_llm_request``（而不是直接调私有方法）：异常吞噬、幂等、日志
 这些契约必须与实际运行时经过同一条路径，否则测的是另一段代码。
@@ -36,7 +37,7 @@ class FakeToolManager:
     与核心一致：``get_builtin_tool`` 按名返回**同一个缓存实例**（核心用
     ``builtin_func_list`` 按类缓存），所以"注入的就是核心那一个"可以用 ``is`` 断言。
     ``raises`` 用来模拟内置工具注册表不可用；``returns_none`` 模拟"注册表可用、但这个名字
-    没登记"（VERIFY-KB-R3 §9 P3-2：实测核心只会抛异常，所以这属**理论**分支，但它一旦发生
+    没登记"（实测核心只会抛异常，所以这属**理论**分支，但它一旦发生
     就是零日志静默失效，必须有回归钉）。
     """
 
@@ -64,7 +65,7 @@ class FakeProvider:
     真身的 ``provider_config`` 由 ``AbstractProvider.__init__`` 赋值
     （``core/provider/provider.py:34``），里面就是 WebUI 那份 provider 配置（含
     ``modalities``）。``provider_config=None`` 用来模拟"拿到的对象**没有** provider 配置"
-    —— 例如 ``get_provider_by_id`` 返回了 TTS/Embedding 实例（详见 AUDIT-KB §3.2 第 9 行）。
+    —— 例如 ``get_provider_by_id`` 返回了 TTS/Embedding 实例（没有 ``provider_config``）。
     """
 
     def __init__(self, provider_config: dict | None = None) -> None:
@@ -82,7 +83,7 @@ class FakeContext:
 
     默认**一个 provider 方法都不提供**：这既是 0.2.0 测试里 ``FakeContext`` 的原貌，也
     正好复刻"Context 完全没有 provider 查询 API"（旧核心 / 自定义调用方 / 契约冒烟的
-    ``_StubContext``，见 AUDIT-KB §3.2 第 8 行与 §4.3）。
+    ``_StubContext``）。
 
     ``provider_api`` 选择挂哪些方法。方法是**实例属性**：没选中的就真的不存在，插件的
     ``getattr(context, "...", None)`` 探测才会得到 ``None``（这是版本差异的关键——4.27.5
@@ -157,7 +158,8 @@ class FakeContext:
             raise self.provider_error
 
 
-#: "配置里没有 ``modalities`` 这个键"——必须与 ``None`` 区分开（AUDIT-KB §3.2 第 10 行）。
+#: "配置里没有 ``modalities`` 这个键"——必须与 ``None`` 区分开（两者语义不同：缺键是
+#: "从未配置"，``None`` 是"显式写成了空值"，核心对后者在 4.23.0 会自己抛 ``TypeError``）。
 MISSING = object()
 
 
@@ -485,12 +487,12 @@ def test_15_non_dict_session_config_falls_back_to_global(plugin_module, hook, sp
 
 
 # ---------------------------------------------------------------------------
-# provider 工具能力判定（``respect_provider_tool_support``，AUDIT-KB §3.2 判定表 16 行）
+# provider 工具能力判定（``respect_provider_tool_support`` 的判定表）
 #
 # 判据只有一条：**``modalities`` 是非空 list 且不含 ``tool_use``** 才算"不支持工具"。
 # ``None`` / ``[]`` / 缺键 / 非 list / 取不到 provider / 探测抛异常一律 fail-open 注入
-# （AUDIT-KB §0.2：4.29 把空值当"未配置，默认支持全部模态"，按否定信号处理会让绝大多数
-# 没填"模型能力"的用户直接失去工具）。
+# （4.29 把空值当"未配置，默认支持全部模态"：``tool_loop_agent_runner.py:665-669``；
+# 按否定信号处理会让绝大多数没填"模型能力"的用户直接失去工具）。
 # ---------------------------------------------------------------------------
 
 
@@ -692,7 +694,7 @@ def test_22b_no_provider_api_is_a_silent_fail_open(plugin_module, hook, logs):
 
     静默是契约而非疏忽：``test_01`` 断言成功注入路径**恰好 1 条** DEBUG；这条路径若也打
     一条"按支持处理"，``test_01`` 就退化成 2 条。契约冒烟的 ``_StubContext`` 同样是这个
-    形状（AUDIT-KB §4.3 的 CI 哨兵）。
+    形状（契约冒烟的 ``_StubContext`` 就是这种形状的 CI 哨兵）。
     """
     plugin, _, context, tool = make_plugin(plugin_module, kb_names=["kb1"])
 
@@ -852,11 +854,11 @@ def test_26_no_kb_returns_before_the_provider_probe(plugin_module, hook, logs):
 
 
 def test_27_non_standard_func_tool_keeps_0_2_0_behavior(plugin_module, hook, logs):
-    """AUDIT-KB §3.2 第 4 行**未在本轮实现**：非标准 ``func_tool`` 仍是"ERROR 一次 + 不注入"。
+    """非标准 ``func_tool``（缺 ``get_tool``）**未在本轮实现**：仍是"ERROR 一次 + 不注入"。
 
     为什么不顺手加防御：本轮硬约束是"开关关闭时逐字节等价 0.2.0"。给这条输入加防御会让
-    它从 ERROR 变成 DEBUG（日志可观察行为变了），等价性就不再成立；AUDIT-KB §7 第 6 行也
-    把它列为"本轮不修"的残余风险（非公开契约的边缘）。
+    它从 ERROR 变成 DEBUG（日志可观察行为变了），等价性就不再成立；内部审计把它列为
+    "本轮不修"的残余风险（非公开契约的边缘）。
 
     本用例的价值是把现状钉成**与开关无关**：两个开关值下行为完全一致，所以等价性成立。
     """
@@ -904,7 +906,7 @@ def test_28_conf_schema_and_plugin_read_the_same_config_keys(plugin_module):
 
     item = schema["respect_provider_tool_support"]
     assert item["type"] == "bool", "非 bool 会让面板渲染成输入框"
-    assert item["default"] is True, "默认必须是 true：false 等于没修（AUDIT-KB §3.4）"
+    assert item["default"] is True, "默认必须是 true：false 等于没修"
     assert item["description"]
     hint = item["hint"]
     assert "tool_use" in hint, "hint 必须写清判据里的关键词"
@@ -1025,7 +1027,7 @@ def test_30_only_when_kb_configured_off_injects_without_kb(plugin_module, hook, 
 # ---------------------------------------------------------------------------
 # 配置值健壮性（P2-1，R4 必修）
 #
-# 实测的反例（VERIFY-KB-R3 §9 P2-1）：手改 ``_conf_schema.json`` 里
+# 实测的反例：手改 ``_conf_schema.json`` 里
 # ``respect_provider_tool_support: "false"`` 时 ``bool("false") is True`` → 闸门**仍然开**，
 # 用户的意图被静默反转；键名拼错则整项被静默忽略、用户以为生效了。
 # 修法：布尔值走显式白名单，认不出就用默认值 + 一次性 WARNING；未知键同样一次性 WARNING。
@@ -1196,7 +1198,7 @@ def test_35b_unknown_config_keys_are_listed_in_one_warning(plugin_module, logs):
 
 
 # ---------------------------------------------------------------------------
-# 其余 P3 收口（VERIFY-KB-R3 §9）
+# 其余收口：注册表返回 None 的自愈、异常去重键的粒度
 # ---------------------------------------------------------------------------
 
 
@@ -1237,7 +1239,7 @@ def test_36_registry_returning_none_warns_once_and_self_heals(
 def test_37_exception_dedupe_uses_the_message_summary(plugin_module, hook, logs):
     """P3-1：异常去重键 = 类型 + 消息摘要，同类型不同原因**各留一条**。
 
-    实测（VERIFY-KB-R3 §7 表「同一异常类型、两种原因」）：只按类型去重时第二条被静默吞掉，
+    实测（同一异常类型、两种原因）：只按类型去重时第二条被静默吞掉，
     排障时看不到真正的原因。同一句话重复出现仍只记一条（去重本身要保住）。
     """
     plugin, _, context, tool = make_plugin(

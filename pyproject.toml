@@ -22,8 +22,8 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-# tests/ 下的本地替身模块，按第一方处理（与第三方 yaml 分开排序）。
-known-first-party = ["_astrbot_stub"]
+# tests/ 下的本地辅助模块，按第一方处理（与第三方 pytest/yaml 分开排序）。
+known-first-party = ["_astrbot_stub", "_contract_evidence"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

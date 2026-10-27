@@ -109,3 +109,107 @@ def test_39_string_false_risk_is_backed_by_a_runnable_probe():
         assert "probe_core_config.py" in text, (
             f"{name} 讲了字符串 false 的风险，却没指向 tests/probe_core_config.py"
         )
+
+
+def test_40_probe_and_contract_smoke_have_no_machine_specific_paths():
+    """可复跑性：探针与契约冒烟里不能写死本机路径，``SRC`` 必须来自环境变量。
+
+    为什么值得一条用例：这两份脚本是"结论的证据"。写死 ``D:\\UwU\\...`` 时它们在本机能跑、
+    在别人机器上只会报"你的目录不存在"——证据就变成了不可复跑的断言（R5 §5.1 实测）。
+    ``contract_smoke.py`` 的假绿守卫另见 ``tests/test_contract_evidence.py``。
+    """
+    markers = ("D:\\UwU", "dshworkdir", "D:\\AstrBot", "fix-venv", "C:\\Users")
+    for name in ("tests/probe_core_config.py", "tests/contract_smoke.py"):
+        text = (REPO_ROOT / name).read_text(encoding="utf-8")
+        for marker in markers:
+            assert marker not in text, f"{name} 里还有本机路径: {marker}"
+
+    probe = (REPO_ROOT / "tests" / "probe_core_config.py").read_text(encoding="utf-8")
+    # 仓库根必须由 __file__ 反推（换克隆目录不用改代码）。
+    assert "Path(__file__).resolve().parent.parent" in probe
+    # SRC 必须必填：缺了就明确报错退出，而不是回落到某个本机默认值。
+    assert 'os.environ.get("PROBE_SRC", "")' in probe
+    assert "SystemExit(2)" in probe
+    # 与契约冒烟同一条防假绿断言：实际导入的 astrbot 必须在 PROBE_SRC 之下。
+    assert "astrbot.__file__" in probe
+
+
+#: 审计/实现/架构过程文档的名字前缀。它们**不进仓库**（见 ``.gitignore``）：
+#: 天然含真实 QQ 群号/好友号与生产 provider 清单，而本仓库会随插件市场被 clone 到每台
+#: 用户机器上。过程流水账留在仓库外，面向用户的结论压缩进 README/CHANGELOG。
+AUDIT_DOC_PREFIXES = ("AUDIT-", "IMPL-", "ARCH-", "VERIFY-")
+
+
+def _text_files(root: Path) -> list[Path]:
+    """工作区里的文本文件（跳过 vcs 目录、缓存目录与本用例自己）。"""
+    skip_dirs = {".git", "__pycache__", ".pytest_cache", ".ruff_cache", ".bench_root"}
+    files = []
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        if any(part in skip_dirs for part in path.parts):
+            continue
+        if path.name == Path(__file__).name:
+            continue  # 本文件自己必须写出这些前缀才能断言它们不存在
+        files.append(path)
+    return files
+
+
+def test_41_audit_docs_are_not_in_the_repo_and_leave_no_dangling_references():
+    """P1-3：审计文档不随仓库发布，且全仓不得留指向它们的悬空引用。
+
+    三层断言，对应三种"复发"方式：
+    1. 文件本身不在工作区 —— 只 ``gitignore`` 而不删除，市场打包时仍可能带上；
+    2. ``.gitignore`` 里有规则 —— 否则下次有人新建 ``AUDIT-X.md`` 又会被 ``git add .`` 带进来；
+    3. 源码/测试/文档里不再出现这四个前缀 —— 否则读者会去找一份仓库里根本没有的文件，
+       更糟的是某个测试读它，仓库在别人机器上就跑不起来。
+    """
+    files = _text_files(REPO_ROOT)
+    assert files, "工作区扫描为空，扫描逻辑有问题"
+
+    # 1. 审计文档不在仓库里（按前缀找，不写死具体文件名）。
+    present = [
+        path.name
+        for path in files
+        if path.suffix == ".md" and path.name.startswith(AUDIT_DOC_PREFIXES)
+    ]
+    assert present == [], f"审计文档仍在仓库工作区里: {present}"
+
+    # 2. .gitignore 覆盖这四个前缀（否则下次照样会被误提交）。
+    gitignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
+    for prefix in AUDIT_DOC_PREFIXES:
+        assert f"{prefix}*.md" in gitignore, f".gitignore 缺 {prefix}*.md 规则"
+
+    # 3. 没有任何文件还引用它们。
+    offenders = []
+    for path in files:
+        if path.suffix not in {".py", ".md", ".json", ".yaml", ".toml", ".txt"}:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        for line_number, line in enumerate(text.splitlines(), start=1):
+            for prefix in AUDIT_DOC_PREFIXES:
+                if prefix in line:
+                    offenders.append(
+                        f"{path.relative_to(REPO_ROOT)}:{line_number}: {line.strip()}"
+                    )
+    assert offenders == [], "还有指向仓库外审计文档的悬空引用:\n" + "\n".join(offenders)
+
+
+def test_42_tests_never_read_the_audit_docs():
+    """任何测试都不得依赖那两份审计文档存在（否则仓库在别人机器上就跑不起来）。
+
+    与 ``test_41`` 的区别：41 查"文本里还提不提"，这条查"**真的有人去读它**"——
+    ``Path(...).read_text()`` / ``open(...)`` 之类会被 41 漏掉的用法（例如拼接文件名）。
+    """
+    for path in _text_files(REPO_ROOT / "tests"):
+        if path.suffix != ".py":
+            continue
+        # 本文件（test_docs.py）由 _text_files 跳过：它必须写出这些前缀才能断言它们不存在。
+        text = path.read_text(encoding="utf-8")
+        for prefix in AUDIT_DOC_PREFIXES:
+            assert f'"{prefix}' not in text and f"'{prefix}" not in text, (
+                f"{path.name} 里用字符串常量引用了审计文档 {prefix}*.md"
+            )
