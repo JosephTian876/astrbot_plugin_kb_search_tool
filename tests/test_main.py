@@ -1735,7 +1735,14 @@ def test_29_switch_off_is_observably_identical_to_0_2_0(
     else:
         assert req.func_tool is None
         assert messages(logs, logging.DEBUG) == []
-        assert len(messages(logs, logging.WARNING)) == 1
+        # 逐字断言（第 3 处已声明差异）：0.2.0 的文案只有前两句，0.3.0 多了括号里那句。
+        # 这条分支此前只断言"1 条 WARNING"，于是"文案逐条相同"这句承诺在**默认可见**的
+        # WARNING 上从来没被钉住 —— R7 §8.3 正是从这个缺口里发现第三处差异的。
+        assert messages(logs, logging.WARNING) == [
+            "[KBTool] 当前会话与主配置都没有可用知识库，已跳过注入工具；"
+            "如需强制注入请关闭 only_when_kb_configured。"
+            "（本条每个插件生命周期只提示一次：之后别的会话遇到同样情况不再重复。）"
+        ], "第 3 处已声明差异：文案比 0.2.0 多了'只提示一次'那句，必须逐字钉住"
     assert messages(logs, logging.ERROR) == []
 
 

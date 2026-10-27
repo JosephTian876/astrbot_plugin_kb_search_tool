@@ -73,13 +73,30 @@
 | `only_when_kb_configured` | `true` | 只在「当前会话或主配置里**配置了非空**的知识库」时注入。判定顺序与核心检索一致：会话级 `kb_config.kb_ids` 优先、主配置 `kb_names` 兜底（`core/tools/knowledge_base_tools.py`）。**不校验知识库是否存在或是否有内容**（那要读核心私有面，本插件不碰），所以 `kb_ids` 指向已删除的知识库时仍会注入，此时工具会返回 `No relevant knowledge found.`。关闭后总是注入。 |
 | `respect_provider_tool_support` | `true` | 注入前读一次「当前会话实际使用的 provider」的「模型能力（`modalities`）」：**只有**它是「非空 list 且不含 `tool_use`」时才跳过注入并 WARNING 一次（每个 provider+model 一次）。`modalities` 为 `None`／空 list／缺键／非 list、取不到 provider、读取抛异常 —— 一律按支持处理、照常注入（fail-open，与核心「未配置=默认支持全部模态」一致）；图片请求可能被核心切给 fallback provider 时同样按支持处理。关掉即回到 0.2.0 的「总是注入」（承诺范围见下）。**注意「配置 ≠ 真实能力」**：模型其实支持函数调用、只是没勾「工具使用」时也会被跳过 —— 看到那条 WARNING 就去 WebUI 的 provider 设置里确认；4.23–4.26 没有 `get_using_provider_async()`，会回退同步查询（见「适用范围与边界」）。 |
 
-**关掉 `respect_provider_tool_support` 之后，和 0.2.0 的差别只有两处（都已声明）**：
+**关掉 `respect_provider_tool_support` 之后，和 0.2.0 的差别都在下面（共 5 条，全部已声明）**：
 
-> 不查询 provider（0 次）、注入决策与 0.2.0 完全一致、日志行为不相对于 0.2.0 变化 —— 除
-> ① 非标准 `func_tool`（别的插件换成缺 `get_tool`/`add_tool` 的对象）：0.2.0 是每请求一条
-> 带 traceback 的 ERROR，0.3.0 是一次性 WARNING + 跳过注入；② 「注入成功」那条 DEBUG
-> 末尾多了 `判定对象=…`（开关关闭时写 `未查询（respect_provider_tool_support=false）`）。
-> 两处都不影响判定结果，且 ① 只在异常输入下发生、② 只在 DEBUG 级可见。
+> 不查询 provider（0 次）、注入决策与 0.2.0 完全一致（真布尔值配置下）、
+> 日志行为不相对于 0.2.0 变化 —— 除下面 5 条：
+>
+> 1. 非标准 `func_tool`（别的插件换成缺 `get_tool`/`add_tool` 的对象）：0.2.0 是每请求一条
+>    带 traceback 的 ERROR，0.3.0 是一次性 WARNING + 跳过注入。
+> 2. 「注入成功」那条 DEBUG 末尾多了 `判定对象=…`（开关关闭时写
+>    `未查询（respect_provider_tool_support=false）`）。只在 DEBUG 级可见。
+> 3. **「无可用知识库」那条 WARNING 的文案**多了最后一句
+>    `（本条每个插件生命周期只提示一次：之后别的会话遇到同样情况不再重复。）`
+>    —— 它一直是全局一次，旧文案读起来像每会话一次。级别、触发条件、条数都没变，
+>    **只有文案变长**；但它是**默认 INFO 下可见**的，所以单列一条。
+> 4. `func_tool.get_tool` / `add_tool` 抛异常（形状对、行为坏的对象）：每请求一条带
+>    traceback 的 ERROR → **一次性 ERROR**（异常仍不冒泡，只是这次不注入）。
+> 5. `sp.session_get` 抛异常（知识库判定失败）：每请求一条 DEBUG → **同一原因一条**。
+>
+> 第 1、4、5 条只在异常输入下发生，第 2 条只在 DEBUG 级，**第 3 条是唯一一条正常配置
+> （没配知识库）下就能看到的差异**。
+>
+> 另有一条**已知的配置解析差异**（故意的健壮性行为，只影响非法值）：`enable` 被写成非布尔
+> 值时判定与 0.2.0 不同 —— `enable="false"` 0.2.0 注入、0.3.0 不注入；`enable=[]` /
+> `enable=None` 0.2.0 不注入、0.3.0 注入（认不出 → 回落默认 `true` 并 WARNING 一次）。
+> 真布尔值路径不变。
 
 旧版 README/CHANGELOG 里"142/1260 个场景观测 JSON SHA256 完全相同"的表述已**收窄**：那套
 矩阵 harness 在仓库外、谁也无法复跑，而它恰好挡住了上面那条 ERROR 刷屏路径。现在这条承诺

@@ -288,7 +288,11 @@ def test_62_equivalence_promise_is_narrowed_and_names_its_exceptions():
     旧口径是"142/1260 个场景观测 JSON SHA256 完全相同"—— 那套 harness 在仓库外、谁也无法
     复跑，而它恰好唯一挡住了"非标准 `func_tool` 每请求刷 ERROR"这条路径。新口径只承诺
     **能在这里复验的三件事**：不查询 provider、注入决策一致、日志行为不变（除已声明的
-    两处）。这条用例钉住措辞与那两处差异都在，避免哪天又漂回不可复跑的表述。
+    差异）。这条用例钉住措辞与那几处差异都在，避免哪天又漂回不可复跑的表述。
+
+    R7 §8.3 的教训：这里原本只钉住"两处"，而实际有第三处（「无可用知识库」那条 WARNING 的
+    文案，**WARNING 级、默认可见、正常配置下触发**）。所以现在把"第三处 + 非布尔配置值的
+    已知差异"也钉进文档，并禁止"只有两处"这类**枚举不全**的措辞再出现。
     """
     for name in ("CHANGELOG.md", "README.md"):
         text = (REPO_ROOT / name).read_text(encoding="utf-8")
@@ -296,9 +300,23 @@ def test_62_equivalence_promise_is_narrowed_and_names_its_exceptions():
         assert "注入决策与 0.2.0 完全一致" in text, f"{name} 缺'注入决策'承诺"
         assert "日志行为不相对于 0.2.0" in text, f"{name} 缺'日志行为'承诺"
         assert "不查询 provider（0 次）" in text, f"{name} 缺「不查询 provider」承诺"
-        # 两处已声明的差异都必须写明（否则承诺就是空头支票）。
+        # 已声明的差异都必须写明（否则承诺就是空头支票）。
         assert "非标准 `func_tool`" in text, f"{name} 没写第 1 处已声明差异"
         assert "判定对象" in text, f"{name} 没写第 2 处已声明差异"
+        # 第 3 处（R7 发现的漏报）：WARNING 级、默认可见的那条文案差异，必须逐字出现。
+        assert "无可用知识库" in text, f"{name} 没写第 3 处已声明差异"
+        assert "（本条每个插件生命周期只提示一次" in text, (
+            f"{name} 没写出第 3 处差异的具体文案"
+        )
+        # 第 4、5 处（异常路径降噪）与非布尔配置值的已知差异。
+        assert "一次性 ERROR" in text, f"{name} 没写第 4 处已声明差异"
+        assert "每请求一条 DEBUG" in text, f"{name} 没写第 5 处已声明差异"
+        assert 'enable="false"' in text and "enable=[]" in text, (
+            f"{name} 没写非布尔 enable 值的已知差异"
+        )
+        # 枚举不全的旧措辞必须消失（"差别只有两处"是 R7 判定 FAIL 的原话）。
+        for wrong in ("只有两处", "下面两处", "差别只有"):
+            assert wrong not in text, f"{name} 还留着枚举不全的措辞: {wrong}"
         # 旧口径必须消失：它既不可复跑，又被本版的行为变化推翻。
         # （允许在"为什么改口径"那一段里**引用**旧措辞，但那时段落里必须写明是旧版本写的。）
         assert "逐字节回到 0.2.0" not in text, f"{name} 还留着旧的'逐字节'口径"
@@ -317,7 +335,8 @@ def test_63_promise_is_backed_by_a_runnable_test_not_by_the_offline_matrix():
     """承诺必须由**仓库内**的用例钉住：``test_29`` 断言 provider 0 次 + 日志逐条相同。
 
     这条是结构钉：如果哪天有人删掉 ``test_29``（或把它改成只断言"注入了"），承诺就又变成
-    口头保证。这里同时钉住它覆盖了 modalities 的各种形态与有无知识库两个维度。
+    口头保证。这里同时钉住它覆盖了 modalities 的各种形态与有无知识库两个维度，以及
+    ``kb_names=[]`` 分支**逐字**断言第 3 处差异的文案（R7 §8.3：只断言条数不够）。
     """
     source = (REPO_ROOT / "tests" / "test_main.py").read_text(encoding="utf-8")
 
@@ -336,6 +355,10 @@ def test_63_promise_is_backed_by_a_runnable_test_not_by_the_offline_matrix():
     assert 'config={"respect_provider_tool_support": False}' in block
     assert "provider_calls == []" in block, "必须断言 provider 一次都没查"
     assert "messages(logs, logging.DEBUG) ==" in block, "必须逐字断言日志"
+    assert "messages(logs, logging.WARNING) ==" in block, (
+        "kb_names=[] 分支必须逐字断言那条 WARNING 的文案（第 3 处差异）"
+    )
+    assert "只提示一次" in block, "第 3 处差异的具体文案必须被钉在 test_29 里"
     assert "_ProviderMustNotBeTouched" in source, (
         "开关关闭时要用 BaseException 陷阱证明'一次都没碰 provider'"
     )
