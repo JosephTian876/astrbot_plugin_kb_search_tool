@@ -211,20 +211,15 @@ def provider_ids(providers: object) -> set[str] | None:
         return None
 
 
-def config_chat_provider_configs(config: object) -> list[dict] | None:
-    """配置里"核心会**加载成 chat provider**"的那些条目；判断不了返回 ``None``。
+def config_provider_configs(config: object) -> list[dict] | None:
+    """配置里的**全部** provider 条目（含禁用的）；任何一处读不懂就返回 ``None``。
 
-    过滤规则逐条对齐 ``ProviderManager.load_provider``（4.29.1 ``:663-680`` / 4.23.0
-    ``:535-546``）：
-
-    - ``provider_type`` 属于 ``_NON_CHAT_PROVIDER_TYPES`` → 跳过（进的是别的 ``*_insts`` 列表，
-      或 ``agent_runner`` 被核心显式 return 掉）；
-    - ``enable`` 为假 → 跳过（核心 ``if not provider_config["enable"]: return``，不加载 =
-      也就不会进 ``inst_map``，解析不到）；
-    - 其余（含缺 ``provider_type`` 的 chat 条目）→ 计入。
-
-    任何一处"读不懂"都返回 ``None``（缺 ``id``、条目不是 Mapping、``provider_type`` 不是
-    字符串、缺 ``enable`` 键）：这时无法断言"配置与加载表一致"，只能退回查 DB。
+    与 ``config_chat_provider_configs`` 的分工：这里只做"能不能安全地读"，不做分类。
+    为什么要连**禁用的**条目一起返回：核心禁用某个 provider 时是"先把配置写成
+    ``enable=false``、再 ``reload()`` → ``terminate_provider()``"（4.29.1
+    ``core/provider/manager.py:950``/``:825``），所以在 ``terminate()`` 那个 await 里，
+    配置已经说"它没启用"、而 ``inst_map`` 里那个**旧实例**仍能被解析到。判断"不许放行"时
+    必须看得到它 —— 见 ``prefilter_proves_support``。
     """
     providers = config.get("provider") if isinstance(config, Mapping) else None
     if not isinstance(providers, list) or not providers:
@@ -239,28 +234,53 @@ def config_chat_provider_configs(config: object) -> list[dict] | None:
         provider_type = entry.get("provider_type")
         if provider_type is not None and not isinstance(provider_type, str):
             return None
-        if provider_type in _NON_CHAT_PROVIDER_TYPES:
-            continue
         if "enable" not in entry:
             return None  # 核心自己会在 load_provider 里 KeyError，这里无从判断
-        if not entry["enable"]:
-            continue
         result.append(dict(entry))
     return result
+
+
+def config_chat_provider_configs(config: object) -> list[dict] | None:
+    """配置里"核心会**加载成 chat provider**"的那些条目；判断不了返回 ``None``。
+
+    过滤规则逐条对齐 ``ProviderManager.load_provider``（4.29.1 ``:663-680`` / 4.23.0
+    ``:535-546``）：
+
+    - ``provider_type`` 属于 ``_NON_CHAT_PROVIDER_TYPES`` → 跳过（进的是别的 ``*_insts`` 列表，
+      或 ``agent_runner`` 被核心显式 return 掉）；
+    - ``enable`` 为假 → 跳过（核心 ``if not provider_config["enable"]: return``，不加载 =
+      也就不进 ``inst_map``，稳态下解析不到）；
+    - 其余（含缺 ``provider_type`` 的 chat 条目）→ 计入。
+
+    这份列表只用于"加载表是否完整"的**数量/编号比对**。"能不能放行"还要另看
+    ``config_provider_configs``（含禁用条目）的声明扫描 —— 禁用条目的实例在 terminate
+    窗口里仍可能被解析到，不能因为"没启用"就无视它的能力声明。
+    """
+    entries = config_provider_configs(config)
+    if entries is None:
+        return None
+    return [
+        entry
+        for entry in entries
+        if entry["enable"]
+        and entry.get("provider_type") not in _NON_CHAT_PROVIDER_TYPES
+    ]
 
 
 def prefilter_proves_support(loaded: object, config: object) -> bool:
     """静态预筛（O1）的完整判据：能否**不查 provider** 就断言"本次必然判为支持"。
 
-    三个条件**必须同时**成立，任何一个不成立都只是"证明不了"（照旧查一次 DB），
+    四个条件**必须同时**成立，任何一个不成立都只是"证明不了"（照旧查一次 DB），
     绝不表示"不支持"：
 
     1. 已加载的 chat provider 实例**非空**，且没有一个声明缺 ``tool_use``
        （``all_providers_declare_tool_support``）；
-    2. 配置里的 chat provider 条目**非空**，且没有一个声明缺 ``tool_use``；
-    3. 两者的 ``id`` 集合**完全相等**（同一个数量、同一批 id）。
+    2. 配置里的 provider 条目**非空**，且**没有任何一条**（含禁用的、含 TTS/Embedding 这类
+       非 chat 的）声明缺 ``tool_use``；
+    3. 配置里"会被加载成 chat provider"的条目**非空**；
+    4. 第 3 条的 ``id`` 集合与已加载实例的 ``id`` 集合**完全相等**（数量与 id 都一致）。
 
-    为什么需要第 2、3 条 —— 它们堵的是 ``terminate_provider`` 的窗口：
+    为什么需要第 2、3、4 条 —— 它们堵的是 ``terminate_provider`` 的窗口：
 
     核心删/改/重载 provider 时先把实例移出 ``provider_insts``（4.29.1 ``manager.py:883``），
     再 ``await inst.terminate()``（``:901``，openai 源是 ``await client.close()``，**真的会让出
@@ -273,24 +293,36 @@ def prefilter_proves_support(loaded: object, config: object) -> bool:
     ``update_provider`` 先改配置再 reload，``:950``），所以"加载表 id 集合 == 配置 chat id
     集合"在窗口期内必然不成立。
 
+    第 2 条为什么**不按 enable 过滤**：用户"禁用"一个 provider 时，配置先变成
+    ``enable=false``、随后才 ``terminate`` —— 在这个 await 里配置已经说"没启用"，而
+    ``inst_map`` 里那个旧实例仍能被会话偏好解析到。如果只扫"启用的 chat 条目"，这一刻就会
+    得出"没人声明不支持"（因为唯一的 offender 被"没启用"过滤掉了）。所以声明扫描宁严勿宽：
+    禁用的、非 chat 的条目一起看。代价只是"配置里留着一个禁用且声明不支持的 provider"的
+    部署不再享受这项优化（实测本机真实配置里就有这样一条，但它同时还有一条启用的 offender，
+    本来也不会命中）。
+
     残留边界（诚实记录）：本判据假设"被加载的 chat 实例，其 ``id`` 来自配置里的某个条目"。
-    若第三方代码绕过 ``ProviderManager`` 直接往 ``inst_map`` 里塞一个配置里没有的实例，第 3 条
-    会因为 id 对不上而退回查 DB；但若**同时**把配置里的对应条目删掉，这份判据看不到那个实例
-    —— 它只能是"多查一次"或"看不见"，本插件不改核心、也不读 ``inst_map``（私有面）。
+    若第三方代码绕过 ``ProviderManager`` 直接往 ``inst_map`` 里塞一个配置里没有的实例，
+    第 4 条会因为 id 对不上而退回查 DB；但若**同时**把配置里的对应条目删掉、且把那条
+    "禁用+改能力声明"的编辑在同一次保存里做完，这份判据看不到那个实例 —— 本插件不改核心、
+    也不读 ``inst_map``（私有面），无法再进一步。
     """
     if not isinstance(loaded, (list, tuple)):
         return False  # 不是可数序列就没法比数量（生成器也在此止步）
     if not all_providers_declare_tool_support(loaded):
         return False
+    entries = config_provider_configs(config)
+    if not entries:
+        return False
+    if any(_declares_missing_tool_use(entry) for entry in entries):
+        return False  # 声明层面的否定信号（含禁用的实例，见 docstring 第 2 条）
     chat_configs = config_chat_provider_configs(config)
     if not chat_configs:
         return False
     loaded_ids = provider_ids(loaded)
     if loaded_ids is None or len(loaded_ids) != len(loaded):
         return False  # 有实例读不到 id，或 id 重复 → 两边无法一一对应
-    if loaded_ids != {entry["id"] for entry in chat_configs}:
-        return False  # 加载表与配置不一致 = 正在重载/删除/加载失败 → 证明不了
-    return not any(_declares_missing_tool_use(entry) for entry in chat_configs)
+    return loaded_ids == {entry["id"] for entry in chat_configs}
 
 
 def selected_provider_id(event: object) -> str | None:

@@ -257,10 +257,17 @@ persona 里也不要再把知识库描述成目录树。
   注入。只读，不改 provider、不改配置；关掉 `respect_provider_tool_support` 就完全跳过这一步。
 - 0.3.0 还带一个**纯内存预筛**（0.3.0 的实现细节，不成配置项）：只有当「配置里的 chat
   provider 条目」与「已加载的 chat provider 实例」**完全对应**（id 集合相同、数量相同），
-  且两边都没有声明「非空且缺 `tool_use`」时，才跳过那次数据库点查（实测 1.09–1.21 ms →
-  0.003 ms/请求）。**任何一处对不上就照旧查一次**：`get_all_providers()` 缺失/抛异常/返回空、
-  配置里没有 `provider` 段、两边 id 集合不一致（provider 正在重载/删除/加载失败）、
-  会话级 `selected_provider` 存在、或任一 provider 声明缺 `tool_use`。
+  且配置里**没有任何一条**（**含禁用的、含 TTS/Embedding 这类非 chat 的**）声明「非空且缺
+  `tool_use`」时，才跳过那次数据库点查（实测 0.98–1.39 ms → 约 0.005 ms/请求）。**任何一处对
+  不上就照旧查一次**：`get_all_providers()` 缺失/抛异常/返回空、配置里没有 `provider` 段、
+  两边 id 集合不一致（provider 正在重载/删除/加载失败）、会话级 `selected_provider` 存在、
+  或任一条目声明缺 `tool_use`。
+  - 为什么连"禁用的"也要看：核心禁用某个 provider 的顺序是**先把配置写成 `enable=false`、
+    再 `reload()`→`terminate()`**（`core/provider/manager.py:950` → `:825`）。在
+    `terminate()` 的那个 await 里，配置已经说"没启用"，而 `inst_map` 里那个旧实例仍能被
+    会话偏好解析到 —— 只看"启用的条目"就会在这一刻误判为"没人声明不支持"。代价是"配置里
+    留着一个禁用且声明不支持的 provider"的部署不再享受这项优化（实测本机真实配置里就有这样
+    一条，但它同时还有一条启用的 offender，本来也不会命中）。
   - **边界（可验证的表述，不写"绝不误放行"）**：核心删改 provider 时先把实例移出
     `provider_insts`（`core/provider/manager.py:883`）、再 `await terminate()`（`:901`，
     openai 源是 `await client.close()`，真的会让出事件循环）、最后才 `del inst_map[...]`

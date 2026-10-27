@@ -1363,7 +1363,9 @@ def _instance(entry: dict) -> FakeProvider:
             False,
             "provider_insts 短暂为空",
         ),
-        # 禁用的 offender 不加载 → 解析不到 → 它挡住证明就是过度保守
+        # 禁用的 offender **也**挡住证明：核心"禁用"是先把配置写 enable=false、再
+        # terminate（4.29.1 manager.py:950 → :825），那个 await 里旧实例还在 inst_map 里，
+        # 会话偏好仍能解析到它。所以声明扫描不按 enable 过滤（宁严勿宽）。
         (
             [_instance(_chat_entry("p0"))],
             {
@@ -1372,8 +1374,26 @@ def _instance(entry: dict) -> FakeProvider:
                     _chat_entry("p-off", ["text"], enable=False),
                 ]
             },
-            True,
-            "禁用的 provider 不参与解析",
+            False,
+            "禁用的 offender 也可能在 terminate 窗口里被解析到",
+        ),
+        # 非 chat 的 offender（例如 embedding 配置里带了 modalities）同样挡住证明：
+        # inst_map 里有它，会话偏好指向它时判定读的就是它的 provider_config。
+        (
+            [_instance(_chat_entry("p0"))],
+            {
+                "provider": [
+                    _chat_entry("p0"),
+                    {
+                        "id": "e0",
+                        "enable": True,
+                        "provider_type": "embedding",
+                        "modalities": ["text"],
+                    },
+                ]
+            },
+            False,
+            "非 chat 条目的否定声明也不许放过",
         ),
         # 启用的 offender 且已加载 → 实例扫描那一步就该否掉
         (
@@ -1491,6 +1511,19 @@ _WINDOW_CASES = {
         ],
         _chat_entry("p-bad", ["text"]),
         "update：配置已改成支持，解析到的仍是旧实例",
+    ),
+    # 核心"禁用"某个 provider 的顺序是：先写配置 enable=false、再 reload→terminate
+    # （4.29.1 manager.py:950 → :825）。于是 terminate 的 await 里配置已经说"没启用"、
+    # 而 inst_map 里那个旧实例（modalities=["text"]）仍能被会话偏好解析到。
+    # 若声明扫描按 enable 过滤，这一刻会得出"没人声明不支持"→ 误放行。
+    "disable": (
+        [_chat_entry("p-good", ["text", "tool_use"])],
+        [
+            _chat_entry("p-good", ["text", "tool_use"]),
+            _chat_entry("p-bad", ["text"], enable=False),
+        ],
+        _chat_entry("p-bad", ["text"]),
+        "disable：配置说'已停用'，旧实例还在 inst_map 里",
     ),
 }
 
