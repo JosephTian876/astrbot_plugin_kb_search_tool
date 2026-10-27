@@ -39,6 +39,25 @@ IMAGE_MODALITY = "image"
 #: ``provider_config`` 里没有 ``modalities`` 这个键（与"键存在但值是 None"区分开）。
 _MODALITIES_MISSING = object()
 
+#: 核心 ``ProviderType`` 里**不会**进 ``provider_insts``（chat 列表）的那几个取值
+#: （4.23.0 与 4.29.1 的 ``core/provider/entities.py`` 逐字相同），外加 ``load_provider``
+#: 显式跳过的伪类型 ``agent_runner``。预筛用它把配置项分成"会被加载成 chat provider"与
+#: "不会"两类 —— 后者进的是 ``tts_provider_insts``/``embedding_provider_insts`` 等别的列表，
+#: 不能参与"chat 列表是否完整"的比对。
+#:
+#: 为什么 chat provider 的配置里通常**没有** ``provider_type`` 这个键：注册装饰器
+#: ``register_provider_adapter`` 的 ``default_config_tmpl`` 只写 ``type``/``id``，
+#: ``provider_type`` 默认就是 ``CHAT_COMPLETION``（4.29.1 ``core/provider/register.py:14-49``），
+#: 所以 WebUI 生成的 chat 配置项**不带**该键、而非 chat 配置项带。实测本机一份真实配置
+#: （26 个配置项）就是这个形状：7 个非 chat 都有 ``provider_type``，19 个 chat 都没有。
+#:
+#: 因此判定规则是"**只排除已知的非 chat 取值**"，未列出的取值（含缺键）一律按"可能是
+#: chat"处理。判错的方向只能是"少算了一个非 chat 条目 → id 集合对不上 → 多回落一次查 DB"，
+#: 不会反过来把 chat provider 漏掉。
+_NON_CHAT_PROVIDER_TYPES = frozenset(
+    {"speech_to_text", "text_to_speech", "embedding", "rerank", "agent_runner"}
+)
+
 #: 插件认识的配置键。多出来的键（拼写错误）会一次性 WARNING，而不是静默忽略 ——
 #: 用户以为改的是闸门、实际写了个不存在的名字，是这一类配置最难自查的故障。
 _KNOWN_CONFIG_KEYS = frozenset(
@@ -80,58 +99,162 @@ def parse_bool_setting(value: object) -> bool | None:
     return None
 
 
+def _declares_missing_tool_use(config: object) -> bool:
+    """这份 provider 配置是否构成"**明确**不支持工具"（本插件唯一的否定信号）。
+
+    判据与 ``_provider_tool_support`` 逐字相同：``modalities`` 是**非空 list 且不含
+    ``tool_use``**。缺键 / ``None`` / ``[]`` / 非 list / 配置不是 Mapping —— 都不是否定信号
+    （它们是"未知 → 按支持处理"，与核心 4.29 的"未配置 = 默认支持全部模态"一致）。
+    """
+    if not isinstance(config, Mapping):
+        return False
+    modalities = config.get("modalities", _MODALITIES_MISSING)
+    return (
+        isinstance(modalities, list)
+        and bool(modalities)
+        and TOOL_USE_MODALITY not in modalities
+    )
+
+
 def all_providers_declare_tool_support(providers: object) -> bool:
-    """静态预筛（O1）：可枚举的 chat provider 里，**没有任何一个**声明"不支持工具"。
+    """逐个扫 provider **实例**：可枚举、非空、且没有一个声明"不支持工具"。
 
-    "声明不支持"用的判据与 ``_provider_tool_support`` 逐字相同：``modalities`` 是**非空
-    list 且不含 ``tool_use``**。只要一个这样的 provider 存在，本函数就返回 ``False``。
+    返回 ``False`` 的含义只有一个：**无法证明**"本次请求必然判为支持"，调用方必须回到原来
+    的路径（查一次 provider）。它绝不表示"不支持"：这里只是"别省这一步"的信号。
 
-    返回 ``False`` 的含义只有一个：**无法证明**"本次请求必然判为支持"，调用方必须回到
-    原来的路径（查一次 provider）。它绝不表示"不支持"：这里只是"别省这一步"的信号。
-    因此它的错误方向只可能是"多查一次 DB"（安全），不可能是"误放行"（危险）。
+    单独用它**不足以**跳过查询 —— 它只看得到"当前在列表里的实例"，看不到"刚被移出列表、
+    但核心仍能解析到"的实例（见 ``prefilter_proves_support`` 里对 terminate 窗口的说明）。
+    真正决定"能否跳过"的是 ``prefilter_proves_support``，本函数只是它的一半。
 
-    安全论证（为什么"扫全量 chat provider 都没声明不支持"就能跳过查询）：
+    保守性细节（判错的方向只能是"多查一次 DB"）：
 
-    - 核心解析 provider 只有三条出口：会话级 ``selected_provider`` → ``inst_map.get(id)``、
-      会话偏好 → ``inst_map.get(id)``、都没有 → ``provider_insts[0]``
-      （4.29.1 ``core/provider/manager.py:245-258``）。
-    - 每个成功加载的 provider 同时进 ``inst_map``（``:812``）与（chat 类型）
-      ``provider_insts``（``:778``），禁用的根本不加载（``:670-672``）。而公开面
-      ``Context.get_all_providers()`` 返回的就是 ``provider_insts``（``core/star/context.py``；
-      4.23.0 同款），所以它是 chat provider 的**超集**。
-    - 例外是"会话级 ``selected_provider`` 指向非 chat provider"（``get_provider_by_id``
-      能取到 TTS/Embedding 实例）：那种对象不在 ``get_all_providers()`` 里，无法扫到。
-      调用方因此只在**没有** ``selected_provider`` 时才用本预筛（见
-      ``_static_prefilter_proves_support``），把这条边角彻底排除。
-
-    保守性细节（都不影响正确性，只是别把预筛做激进）：
-
-    - ``providers`` 为 ``None`` / 不可迭代 / 迭代中途抛异常 → ``False``（退回查 DB）；
+    - 空集合 / ``None`` / 不可迭代 / 迭代中途抛异常 → ``False``。**空集合必须是 False**：
+      "没有任何 provider 声明不支持"在空集合上恒真，而空集合恰恰是 provider 重载窗口里
+      最常见的形态（单 provider 配置下 ``provider_insts`` 会短暂变成 ``[]``）—— 那是真空真，
+      不是证明。
     - ``providers`` 是 Mapping（例如有人把 ``inst_map`` 传进来）→ ``False``：对 dict 迭代
       拿到的是**键**，``getattr(key, "provider_config")`` 自然是 None，于是静默得出"全体
       未声明"——那就成了误放行。宁可多查一次。
-    - ``provider_config`` 不是 dict、``modalities`` 缺键/``None``/``[]``/非 list → 跳过该
-      provider：在原判定路径里这些也都是"未知 → 按支持处理"，不是否定信号，跳过后语义一致。
+    - ``providers`` 是 ``str``/``bytes`` → ``False``：它们可迭代，但迭代出来的字符/字节没有
+      ``provider_config``，同样会静默得出"全体未声明"。现实中 ``get_all_providers()`` 不会
+      返回它们，这条只是把同一类"形状不对却静默放行"的口子一起堵上。
     """
-    if providers is None or isinstance(providers, Mapping):
+    if providers is None or isinstance(providers, (Mapping, str, bytes)):
         return False
     try:
         iterator = iter(providers)  # type: ignore[arg-type] - 运行时探测，非静态可判
     except TypeError:
         return False
+    seen = False
     try:
         for provider in iterator:
-            config = getattr(provider, "provider_config", None)
-            if not isinstance(config, dict):
-                continue  # 读不到配置 = 未知；原路径同样按"支持"处理
-            modalities = config.get("modalities", _MODALITIES_MISSING)
-            if not isinstance(modalities, list) or not modalities:
-                continue  # 缺键 / None / 空 list / 非 list：都不是否定信号
-            if TOOL_USE_MODALITY not in modalities:
+            seen = True
+            if _declares_missing_tool_use(getattr(provider, "provider_config", None)):
                 return False  # 有一个"明确不支持" → 无法证明全体支持，退回查 DB
     except Exception:  # noqa: BLE001 - 预筛失败只能退回原路径，绝不能碰瓷主流程
         return False
-    return True
+    return seen
+
+
+def provider_ids(providers: object) -> set[str] | None:
+    """``{provider.provider_config["id"]}``；任何一个读不到 ``id`` 就返回 ``None``。
+
+    ``None`` 的含义同样是"证明不了"：id 是"加载表 vs 配置"比对的唯一凭据，缺一个就没法
+    确认两边说的是同一批 provider。
+    """
+    try:
+        ids: set[str] = set()
+        for provider in providers:  # type: ignore[union-attr] - 运行时探测
+            config = getattr(provider, "provider_config", None)
+            provider_id = config.get("id") if isinstance(config, Mapping) else None
+            if not isinstance(provider_id, str) or not provider_id:
+                return None
+            ids.add(provider_id)
+        return ids
+    except Exception:  # noqa: BLE001 - 与纯函数其余部分同姿态：失败即证明不了
+        return None
+
+
+def config_chat_provider_configs(config: object) -> list[dict] | None:
+    """配置里"核心会**加载成 chat provider**"的那些条目；判断不了返回 ``None``。
+
+    过滤规则逐条对齐 ``ProviderManager.load_provider``（4.29.1 ``:663-680`` / 4.23.0
+    ``:535-546``）：
+
+    - ``provider_type`` 属于 ``_NON_CHAT_PROVIDER_TYPES`` → 跳过（进的是别的 ``*_insts`` 列表，
+      或 ``agent_runner`` 被核心显式 return 掉）；
+    - ``enable`` 为假 → 跳过（核心 ``if not provider_config["enable"]: return``，不加载 =
+      也就不会进 ``inst_map``，解析不到）；
+    - 其余（含缺 ``provider_type`` 的 chat 条目）→ 计入。
+
+    任何一处"读不懂"都返回 ``None``（缺 ``id``、条目不是 Mapping、``provider_type`` 不是
+    字符串、缺 ``enable`` 键）：这时无法断言"配置与加载表一致"，只能退回查 DB。
+    """
+    providers = config.get("provider") if isinstance(config, Mapping) else None
+    if not isinstance(providers, list) or not providers:
+        return None
+    result: list[dict] = []
+    for entry in providers:
+        if not isinstance(entry, Mapping):
+            return None
+        provider_id = entry.get("id")
+        if not isinstance(provider_id, str) or not provider_id:
+            return None
+        provider_type = entry.get("provider_type")
+        if provider_type is not None and not isinstance(provider_type, str):
+            return None
+        if provider_type in _NON_CHAT_PROVIDER_TYPES:
+            continue
+        if "enable" not in entry:
+            return None  # 核心自己会在 load_provider 里 KeyError，这里无从判断
+        if not entry["enable"]:
+            continue
+        result.append(dict(entry))
+    return result
+
+
+def prefilter_proves_support(loaded: object, config: object) -> bool:
+    """静态预筛（O1）的完整判据：能否**不查 provider** 就断言"本次必然判为支持"。
+
+    三个条件**必须同时**成立，任何一个不成立都只是"证明不了"（照旧查一次 DB），
+    绝不表示"不支持"：
+
+    1. 已加载的 chat provider 实例**非空**，且没有一个声明缺 ``tool_use``
+       （``all_providers_declare_tool_support``）；
+    2. 配置里的 chat provider 条目**非空**，且没有一个声明缺 ``tool_use``；
+    3. 两者的 ``id`` 集合**完全相等**（同一个数量、同一批 id）。
+
+    为什么需要第 2、3 条 —— 它们堵的是 ``terminate_provider`` 的窗口：
+
+    核心删/改/重载 provider 时先把实例移出 ``provider_insts``（4.29.1 ``manager.py:883``），
+    再 ``await inst.terminate()``（``:901``，openai 源是 ``await client.close()``，**真的会让出
+    事件循环**），最后才 ``del inst_map[provider_id]``（``:908``）。窗口期内
+    ``Context.get_all_providers()``（= ``provider_insts``）已经看不到它，而
+    ``_resolve_using_provider`` 用的 ``inst_map.get(provider_id)`` 仍能解析到它
+    （``:245``/``:256``）。只满足第 1 条时就会"证明支持 → 跳过那次点查 → 把工具注入给一个
+    声明不支持工具的 provider"，这正是本函数要多看一份**配置快照**的原因：配置的变更
+    时机与 ``provider_insts`` 不同（``delete_provider`` 先 terminate 再改配置，``:925``；
+    ``update_provider`` 先改配置再 reload，``:950``），所以"加载表 id 集合 == 配置 chat id
+    集合"在窗口期内必然不成立。
+
+    残留边界（诚实记录）：本判据假设"被加载的 chat 实例，其 ``id`` 来自配置里的某个条目"。
+    若第三方代码绕过 ``ProviderManager`` 直接往 ``inst_map`` 里塞一个配置里没有的实例，第 3 条
+    会因为 id 对不上而退回查 DB；但若**同时**把配置里的对应条目删掉，这份判据看不到那个实例
+    —— 它只能是"多查一次"或"看不见"，本插件不改核心、也不读 ``inst_map``（私有面）。
+    """
+    if not isinstance(loaded, (list, tuple)):
+        return False  # 不是可数序列就没法比数量（生成器也在此止步）
+    if not all_providers_declare_tool_support(loaded):
+        return False
+    chat_configs = config_chat_provider_configs(config)
+    if not chat_configs:
+        return False
+    loaded_ids = provider_ids(loaded)
+    if loaded_ids is None or len(loaded_ids) != len(loaded):
+        return False  # 有实例读不到 id，或 id 重复 → 两边无法一一对应
+    if loaded_ids != {entry["id"] for entry in chat_configs}:
+        return False  # 加载表与配置不一致 = 正在重载/删除/加载失败 → 证明不了
+    return not any(_declares_missing_tool_use(entry) for entry in chat_configs)
 
 
 def selected_provider_id(event: object) -> str | None:
@@ -299,11 +422,15 @@ class KBSearchToolPlugin(Star):
 
         # 放在最后一步之前：只有"确实要注入"的请求才付这次判定成本（知识库判定更常见）。
         if self.respect_provider_tool_support:
-            # O1 静态预筛：已加载的 chat provider 里没人声明"缺 tool_use"时，无论核心这次
-            # 解析到哪一个，判定结果都只能是"支持" —— 那次 DB 点查（实测约 1.1–1.2 ms）可以
-            # 整段跳过。预筛证明不了就照旧查一次，绝不改变"判定为不支持"的语义。
+            # O1 静态预筛：配置里的 chat provider 与已加载的那批**完全对应**、且没人声明
+            # "缺 tool_use" 时，无论核心这次解析到哪一个，判定结果都只能是"支持" —— 那次
+            # DB 点查（实测约 1.1–1.2 ms）可以整段跳过。预筛证明不了就照旧查一次，绝不改变
+            # "判定为不支持"的语义。
             if self._static_prefilter_proves_support(event):
-                judged = "未查询（静态预筛：已加载 provider 均未声明缺 tool_use）"
+                judged = (
+                    "未查询（静态预筛：配置与已加载的 chat provider 一致，"
+                    "且均未声明缺 tool_use）"
+                )
             else:
                 if not await self._provider_tool_support(event, req):
                     return
@@ -409,11 +536,12 @@ class KBSearchToolPlugin(Star):
             return True
 
     def _static_prefilter_proves_support(self, event: AstrMessageEvent) -> bool:
-        """O1 静态预筛：能否**不查 provider** 就断言"本次必然判为支持"。
+        """O1 静态预筛的入口：能否**不查 provider** 就断言"本次必然判为支持"。
 
-        ``True`` = 已加载的 chat provider 里没有任何一个声明"缺 ``tool_use``"，于是无论核心
-        这次解析到哪一个，``_provider_tool_support`` 都只会返回 ``True`` —— 那次 DB 点查
-        （两次独立跑：median 1.1247 / 1.1975 ms）可以整段跳过。
+        ``True`` = 配置与已加载的 chat provider 一致、且都没有声明缺 ``tool_use``，于是无论
+        核心这次解析到哪一个，``_provider_tool_support`` 都只会返回 ``True`` —— 那次 DB 点查
+        （两次独立跑：median 1.1247 / 1.1975 ms）可以整段跳过。判据本身见
+        ``prefilter_proves_support``（含 terminate 窗口的论证）。
 
         ``False`` = **证明不了**，调用方照旧查一次。这条路径没有任何"判为不支持"的能力：
         最坏结果只是多查一次 DB，所以它不可能放宽 ``respect_provider_tool_support``。
@@ -425,6 +553,12 @@ class KBSearchToolPlugin(Star):
 
         为什么要 ``getattr`` 探测：``get_all_providers`` 不是本插件声明下界（4.23.0）之外
         必须存在的私有面 —— 自定义 Context 替身/第三方加载器可能没有它，缺了就跳过预筛。
+
+        为什么还要读一次配置：``get_all_providers()`` 单独用会在 provider 重载的
+        ``terminate`` 窗口里"看不见"正要被删掉的那个实例（见 ``prefilter_proves_support``）。
+        配置与加载表由不同的代码路径更新，两者 id 集合一致才算证明。这次 ``get_config(umo)``
+        在 ``only_when_kb_configured`` 打开时本来就已经付过（``_kb_available`` 读 ``kb_names``
+        用的是同一个方法、同一个 umo），关掉时多一次内存查表。
         """
         if selected_provider_id(event) is not None:
             return False
@@ -432,9 +566,16 @@ class KBSearchToolPlugin(Star):
         if not callable(getter):
             return False
         try:
-            return all_providers_declare_tool_support(getter())
+            loaded = getter()
         except Exception:  # noqa: BLE001 - 预筛失败只能退回查 DB
             return False
+        try:
+            config = self.context.get_config(
+                umo=getattr(event, "unified_msg_origin", None)
+            )
+        except Exception:  # noqa: BLE001 - 同上：读不到配置就是"证明不了"
+            return False
+        return prefilter_proves_support(loaded, config)
 
     async def _provider_tool_support(
         self, event: AstrMessageEvent, req: ProviderRequest

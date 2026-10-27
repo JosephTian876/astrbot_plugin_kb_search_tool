@@ -237,11 +237,24 @@ persona 里也不要再把知识库描述成目录树。
 - 0.3.0 起多了一步**只读**的能力判定：读「当前会话实际使用的 provider」的 `modalities`
   （会话级 `selected_provider` 优先，与核心 `_select_provider` 同序），据此决定这次要不要
   注入。只读，不改 provider、不改配置；关掉 `respect_provider_tool_support` 就完全跳过这一步。
-- 0.3.0 还带一个**纯内存预筛**（0.3.0 的实现细节，不成配置项）：若已加载的 chat provider
-  里没有任何一个声明「非空且缺 `tool_use`」，那么无论核心这次解析到哪一个，判定都只能是
-  「支持」，于是这次数据库点查被整段跳过（实测 1.12 ms → 0.003 ms/请求）。预筛**只会退回
-  查询，不会误放行**：会话级 `selected_provider` 未命中、`get_all_providers()` 缺失或抛异常、
-  或任一 provider 声明了 `tool_use` 缺失，都照旧走完整判定。
+- 0.3.0 还带一个**纯内存预筛**（0.3.0 的实现细节，不成配置项）：只有当「配置里的 chat
+  provider 条目」与「已加载的 chat provider 实例」**完全对应**（id 集合相同、数量相同），
+  且两边都没有声明「非空且缺 `tool_use`」时，才跳过那次数据库点查（实测 1.09–1.21 ms →
+  0.003 ms/请求）。**任何一处对不上就照旧查一次**：`get_all_providers()` 缺失/抛异常/返回空、
+  配置里没有 `provider` 段、两边 id 集合不一致（provider 正在重载/删除/加载失败）、
+  会话级 `selected_provider` 存在、或任一 provider 声明缺 `tool_use`。
+  - **边界（可验证的表述，不写"绝不误放行"）**：核心删改 provider 时先把实例移出
+    `provider_insts`（`core/provider/manager.py:883`）、再 `await terminate()`（`:901`，
+    openai 源是 `await client.close()`，真的会让出事件循环）、最后才 `del inst_map[...]`
+    （`:908`）。在这个**亚毫秒窗口**（实测 median 0.020 ms / max 0.071 ms）里
+    `get_all_providers()` 已经看不到它，而核心解析 provider 用的 `inst_map.get()` 仍能
+    返回它 —— 只看 `get_all_providers()` 的预筛会因此"证明支持"并跳过点查（0.3.0 修复前
+    在真 4.29.1 上可复现）。要求"配置 chat id 集合 == 加载表 id 集合"之后，窗口期这两边
+    必然对不上（`delete_provider` 先 terminate 再改配置，`:925`；`update_provider` 先改配置
+    再 reload，`:950`），于是自动回落到查询。
+  - **残留边界（诚实写清）**：若第三方代码绕过 `ProviderManager` 直接往 `inst_map` 里塞一个
+    配置里没有的实例、**同时**把配置条目删掉，预筛看不到它（本插件不读 `inst_map`，那是私有面）。
+    这属已知边界，不是承诺。
 - 钩子 `priority = -310000`：核心按 priority 降序执行钩子，负数表示靠后，所以本插件排在
   普通插件（0）之后追加工具；但这**不保证绝对最后**。判重保护的是"我们不去覆盖别人"；
   "被别人覆盖"只能靠排在后面，而那并不保证。

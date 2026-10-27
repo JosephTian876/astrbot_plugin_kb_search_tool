@@ -116,9 +116,10 @@ harness 在仓库外、谁也无法复跑，而它恰好唯一挡住了上面那
 
 ### 性能
 
-- **静态预筛（O1）**：provider 闸门前先扫一遍已加载的 chat provider（`context.get_all_providers()`，
-  纯内存）。若没有任何一个声明「非空且缺 `tool_use`」，那么无论核心这次解析到哪个 provider，
-  判定都只能是"支持"，于是那次数据库点查被整段跳过。
+- **静态预筛（O1）**：provider 闸门前先做一次纯内存判断 —— 「配置里的 chat provider 条目」与
+  「已加载的 chat provider 实例」（`context.get_all_providers()`）**id 集合完全一致**，且两边
+  都没有声明「非空且缺 `tool_use`」时，无论核心这次解析到哪个 provider，判定都只能是"支持"，
+  于是那次数据库点查被整段跳过。
   - 实测（真 4.29.1 + 真 SQLite，5 轮交替取同轮配对差的中位数，
     见 `work\kb-030-artifacts\bench_p2_1_prefilter.py`；两次独立跑的数字）：
     - provider 闸门单独：**1.1247 / 1.1975 ms → 0.0026 / 0.0027 ms**，
@@ -128,9 +129,25 @@ harness 在仓库外、谁也无法复跑，而它恰好唯一挡住了上面那
     - 有 1 个 provider 声明 `["text","image"]` 时（预筛必须退回）：
       2.3361 / 2.2510 ms vs 基线 2.1638 / 2.2945 ms，配对差 −0.16 / +0.01 ms ——
       预筛扫描本身约 0.4 µs，落在噪声里，**没有回归**。
-  - 保守性：预筛只可能"退回查 DB"，**不会误放行**。会话级 `selected_provider` 存在时直接
-    不做预筛（它可能解析到 `get_all_providers()` 里没有的非 chat provider）；`get_all_providers`
-    缺失、抛异常、返回值不可迭代，或任一 provider 声明了 `tool_use` 缺失，都照旧走完整判定。
+    - R8 复测（同一台机器，真 4.29.1，2000 次采样）：预筛入口 **median 0.0029 ms /
+      p95 0.0031 ms**（多读一次 `get_config(umo)` 后从 0.0004 → 0.0029 ms），
+      被替换掉的那次点查 **median 1.2098 ms / p95 1.7109 ms**。
+  - 保守性（可验证的边界，不是"绝不"）：预筛只可能"退回查 DB"，**不会改变"判定为不支持"的
+    语义**。会话级 `selected_provider` 存在时直接不做预筛（它可能解析到
+    `get_all_providers()` 里没有的非 chat provider）；`get_all_providers` 缺失、抛异常、
+    返回空、返回值不是可数序列，配置里没有 `provider` 段，两边 id 集合不一致，或任一
+    provider 声明了 `tool_use` 缺失，都照旧走完整判定。
+  - **为什么要求"配置 id 集合 == 加载表 id 集合"**（0.3.0 修复的一个真实缺口）：核心删改
+    provider 时先把实例移出 `provider_insts`（4.29.1 `core/provider/manager.py:883`）、再
+    `await terminate()`（`:901`，openai 源是 `await client.close()`，真的会让出事件循环）、
+    最后才 `del inst_map[...]`（`:908`）。这个**亚毫秒窗口**（实测 median 0.020 ms /
+    max 0.071 ms）里 `get_all_providers()` 已看不到它，而核心解析 provider 用的
+    `inst_map.get()` 仍能返回它 —— 只扫 `get_all_providers()` 的预筛会"证明支持 → 跳过
+    点查 → 把工具注入给一个声明不支持的 provider"（真 4.29.1 上可复现）。配置与加载表由
+    不同代码路径更新（`delete_provider` 先 terminate 再改配置，`:925`；`update_provider`
+    先改配置再 reload，`:950`），所以窗口期两边 id 集合必然对不上，预筛自动回落。
+    **残留边界**：第三方代码绕过 `ProviderManager` 直接往 `inst_map` 塞一个配置里没有的
+    实例、同时把配置条目删掉时，预筛看不到它（本插件不读 `inst_map`，那是私有面）。
   - 不新增任何日志、不改变任何判定结果：静默预筛，命中与否只看"有没有那次点查"。
 
 ### 配置与文档

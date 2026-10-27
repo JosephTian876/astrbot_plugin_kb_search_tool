@@ -106,6 +106,8 @@ class FakeContext:
         provider_error: BaseException | None = None,
         all_providers: list | None = None,
         all_providers_error: BaseException | None = None,
+        provider_configs: list | None = None,
+        provider_configs_raises: BaseException | None = None,
     ) -> None:
         self._manager = manager
         self.kb_names = list(kb_names or [])
@@ -124,6 +126,12 @@ class FakeContext:
         self.all_providers_error = all_providers_error
         #: 预筛被调用的次数（预筛自身也要"不查 DB"）。
         self.all_providers_calls = 0
+        #: ``get_config(umo)["provider"]``：配置里的 provider 条目。预筛要求"配置里的 chat
+        #: 条目 id 集合 == 已加载的 chat provider id 集合"，所以两者必须能分别构造。
+        #: ``None`` = 由 ``all_providers`` 反推（= **稳态**：配置与加载表一致），这是绝大多数
+        #: 用例的前提；要构造"不一致"（provider 重载的 terminate 窗口）就显式传入。
+        self.provider_configs = provider_configs
+        self.provider_configs_raises = provider_configs_raises
         self._install_provider_api(provider_api)
         if all_providers is not None or all_providers_error is not None:
             self.get_all_providers = self._get_all_providers
@@ -134,6 +142,18 @@ class FakeContext:
             raise self.all_providers_error
         return list(self.all_providers or [])
 
+    def _config_provider_entries(self) -> list:
+        """配置里的 ``provider`` 条目（``get_config`` 的一部分）。"""
+        if self.provider_configs_raises is not None:
+            raise self.provider_configs_raises
+        if self.provider_configs is not None:
+            return [dict(entry) for entry in self.provider_configs]
+        entries = []
+        for provider in self.all_providers or []:
+            config = getattr(provider, "provider_config", None)
+            entries.append(dict(config) if isinstance(config, dict) else {})
+        return entries
+
     def get_llm_tool_manager(self):
         return self._manager
 
@@ -141,7 +161,10 @@ class FakeContext:
         self.config_umos.append(umo)
         if self.raises is not None:
             raise self.raises
-        return {"kb_names": list(self.kb_names)}
+        return {
+            "kb_names": list(self.kb_names),
+            "provider": self._config_provider_entries(),
+        }
 
     def _install_provider_api(self, kinds) -> None:
         kinds = set(kinds)
@@ -193,6 +216,8 @@ def make_plugin(
     provider_error: BaseException | None = None,
     all_providers: list | None = None,
     all_providers_error: BaseException | None = None,
+    provider_configs: list | None = None,
+    provider_configs_raises: BaseException | None = None,
 ):
     """构造被测插件，返回 ``(plugin, manager, context, tool)``。"""
     tool = stub.FunctionTool(plugin_module.KB_TOOL_NAME)
@@ -207,6 +232,8 @@ def make_plugin(
         provider_error=provider_error,
         all_providers=all_providers,
         all_providers_error=all_providers_error,
+        provider_configs=provider_configs,
+        provider_configs_raises=provider_configs_raises,
     )
     plugin = plugin_module.KBSearchToolPlugin(context, config)
     return plugin, manager, context, tool
@@ -883,8 +910,12 @@ def test_26_no_kb_returns_before_the_provider_probe(plugin_module, hook, logs):
 
 
 def _pure_ok(plugin_module, **kwargs) -> FakeProvider:
-    """一个"未配置 modalities"的 provider：插件判它支持。"""
-    config = {"id": "p0", "model": "m0"}
+    """一个"未配置 modalities"的 provider：插件判它支持。
+
+    带 ``enable: True``：真配置里每个 provider 条目都有这个键（``load_provider`` 用
+    ``provider_config["enable"]`` 取值，缺了会 KeyError），预筛要靠它区分"禁用不加载"。
+    """
+    config = {"id": "p0", "model": "m0", "enable": True}
     config.update(kwargs)
     return FakeProvider(config)
 
@@ -892,13 +923,20 @@ def _pure_ok(plugin_module, **kwargs) -> FakeProvider:
 def test_43_prefilter_skips_the_provider_query_when_nobody_declares_unsupported(
     plugin_module, hook, logs
 ):
-    """三件都"未配置能力" → 预筛当场证明支持：provider 一次都不查，注入照旧。"""
+    """配置与加载表一致、且三件都"未配置能力" → 预筛当场证明支持：provider 一次都不查。"""
+    loaded = [
+        FakeProvider({"id": f"p{index}", "model": "m0", "enable": True})
+        for index in range(3)
+    ]
     plugin, _, context, tool = make_plugin(
         plugin_module,
         kb_names=["kb1"],
         provider=_pure_ok(plugin_module),
         provider_api=("async", "sync", "by_id"),
-        all_providers=[_pure_ok(plugin_module) for _ in range(3)],
+        all_providers=loaded,
+        # 稳态：配置里就是这三个 chat provider（默认由 all_providers 反推，这里写出来
+        # 是为了让"两边一致"这件事在用例里显式可见）。
+        provider_configs=[dict(provider.provider_config) for provider in loaded],
     )
 
     for _ in range(3):  # 每请求都重新扫（provider 可能在重载后才变）
@@ -1082,7 +1120,6 @@ def test_49_prefilter_is_not_consulted_when_the_switch_is_off(plugin_module, hoo
     ("configs", "expected"),
     [
         # 全体未声明 → 能证明支持（可跳过查询）
-        ([], True),
         ([{"id": "a"}, {"id": "b", "modalities": None}], True),
         ([{"id": "a", "modalities": []}], True),
         ([{"id": "a", "modalities": ["tool_use"]}], True),
@@ -1092,6 +1129,10 @@ def test_49_prefilter_is_not_consulted_when_the_switch_is_off(plugin_module, hoo
         ([{"id": "a", "modalities": ("tool_use",)}], True),
         ([{"id": "a", "modalities": {"x": 1}}], True),
         (["PROVIDER_WITHOUT_CONFIG"], True),
+        # 空集合：**不是**证明。"没有任何 provider 声明不支持"在空集合上恒真，而空集合
+        # 正是 provider 重载窗口里最常见的形态（单 provider 时 provider_insts 会短暂为 []）。
+        # R7 §3.2b 实测：把 [] 判 True 就是 vacuous truth → 跳过 DB → 误放行。
+        ([], False),
         # 只要有一个"非空且缺 tool_use" → 证明不了
         ([{"id": "a", "modalities": ["text"]}], False),
         (
@@ -1116,9 +1157,13 @@ def test_50_prefilter_pure_function_truth_table(plugin_module, configs, expected
     assert plugin_module.all_providers_declare_tool_support(providers) is expected
 
 
-@pytest.mark.parametrize("bad", [None, 42])
+@pytest.mark.parametrize("bad", [None, 42, "", "abc", b"abc"])
 def test_50b_prefilter_pure_function_rejects_non_iterable(plugin_module, bad):
-    """``None`` / 非可迭代对象 → ``False``（证明不了）。"""
+    """``None`` / 非可迭代对象 / ``str``/``bytes`` → ``False``（证明不了）。
+
+    ``str`` 是可迭代的，但迭代出来的是字符：每个字符都没有 ``provider_config``，于是会
+    静默得出"全体未声明"——与 Mapping 那条同一类"形状不对却放行"（R7 §3.1 的 P3-c）。
+    """
     assert plugin_module.all_providers_declare_tool_support(bad) is False
 
 
@@ -1153,6 +1198,254 @@ def test_52_prefilter_reads_the_same_selected_provider_logic_as_the_gate(plugin_
         "`selected_provider` 只应在 selected_provider_id() 里解析一次"
     )
     assert "selected_provider_id(" in source
+
+
+def _chat_entry(provider_id: str, modalities=MISSING, **extra) -> dict:
+    """一条"核心会加载成 chat provider"的配置项（chat 条目通常不带 ``provider_type``）。"""
+    entry = {"id": provider_id, "model": "m", "enable": True}
+    if modalities is not MISSING:
+        entry["modalities"] = modalities
+    entry.update(extra)
+    return entry
+
+
+def _instance(entry: dict) -> FakeProvider:
+    """把一条配置项变成"已加载"的实例（真身也是把 ``provider_config`` 原样交给 provider）。"""
+    return FakeProvider(dict(entry))
+
+
+@pytest.mark.parametrize(
+    ("loaded", "config", "expected", "reason"),
+    [
+        # 稳态：配置里的 chat 条目 == 已加载的实例，且都没声明缺 tool_use → 能证明
+        (
+            [_instance(_chat_entry("p0"))],
+            {"provider": [_chat_entry("p0")]},
+            True,
+            "稳态且无人声明不支持",
+        ),
+        (
+            [
+                _instance(_chat_entry("p0")),
+                _instance(_chat_entry("p1", ["text", "tool_use"])),
+            ],
+            {
+                "provider": [
+                    _chat_entry("p0"),
+                    _chat_entry("p1", ["text", "tool_use"]),
+                ]
+            },
+            True,
+            "多 provider 全体支持",
+        ),
+        # 加载表少一个 = 正在 terminate（provider_insts 已移除、配置还没改）→ 证明不了
+        (
+            [_instance(_chat_entry("p0"))],
+            {
+                "provider": [
+                    _chat_entry("p0"),
+                    _chat_entry("p1", ["text"]),
+                ]
+            },
+            False,
+            "terminate 窗口：配置里还有一个没加载",
+        ),
+        # 加载表多一个 = 配置里没有它（create 中途/异常加载）→ 证明不了
+        (
+            [_instance(_chat_entry("p0")), _instance(_chat_entry("p9"))],
+            {"provider": [_chat_entry("p0")]},
+            False,
+            "加载表多出一个配置里没有的 id",
+        ),
+        # 配置里根本没有 provider 段 / 是空列表 → 证明不了
+        ([_instance(_chat_entry("p0"))], {}, False, "配置缺 provider 段"),
+        (
+            [_instance(_chat_entry("p0"))],
+            {"provider": []},
+            False,
+            "配置 provider 为空",
+        ),
+        # 空加载表（单 provider 重载窗口）→ 证明不了
+        ([], {"provider": []}, False, "两边都空"),
+        (
+            [],
+            {"provider": [_chat_entry("p0")]},
+            False,
+            "provider_insts 短暂为空",
+        ),
+        # 禁用的 offender 不加载 → 解析不到 → 它挡住证明就是过度保守
+        (
+            [_instance(_chat_entry("p0"))],
+            {
+                "provider": [
+                    _chat_entry("p0"),
+                    _chat_entry("p-off", ["text"], enable=False),
+                ]
+            },
+            True,
+            "禁用的 provider 不参与解析",
+        ),
+        # 启用的 offender 且已加载 → 实例扫描那一步就该否掉
+        (
+            [_instance(_chat_entry("p0")), _instance(_chat_entry("p1", ["text"]))],
+            {"provider": [_chat_entry("p0"), _chat_entry("p1", ["text"])]},
+            False,
+            "已加载的 offender",
+        ),
+        # 配置声明层再扫一遍：实例看不出来（配置被改坏）时也不能放行
+        (
+            [_instance(_chat_entry("p0", ["text", "tool_use"]))],
+            {"provider": [_chat_entry("p0", ["text"])]},
+            False,
+            "实例与配置对同一 id 的声明不一致",
+        ),
+        # 非 chat 条目（embedding/rerank/tts/stt/agent_runner）不进 provider_insts，
+        # 不参与"chat 列表是否完整"的比对
+        (
+            [_instance(_chat_entry("p0"))],
+            {
+                "provider": [
+                    _chat_entry("p0"),
+                    {"id": "e0", "enable": True, "provider_type": "embedding"},
+                    {"id": "r0", "enable": True, "provider_type": "rerank"},
+                    {"id": "t0", "enable": True, "provider_type": "text_to_speech"},
+                    {"id": "s0", "enable": True, "provider_type": "speech_to_text"},
+                    {"id": "a0", "enable": True, "provider_type": "agent_runner"},
+                ]
+            },
+            True,
+            "非 chat 条目不计入 chat id 集合",
+        ),
+        # 显式写出 provider_type=chat_completion 的条目照常计入
+        (
+            [_instance(_chat_entry("p0"))],
+            {"provider": [_chat_entry("p0", provider_type="chat_completion")]},
+            True,
+            "显式 chat_completion 也计入",
+        ),
+        # 读不懂的配置一律"证明不了"
+        (
+            [_instance(_chat_entry("p0"))],
+            {"provider": [{"model": "m", "enable": True}]},
+            False,
+            "配置项缺 id",
+        ),
+        (
+            [_instance(_chat_entry("p0"))],
+            {"provider": [{"id": "p0", "model": "m"}]},
+            False,
+            "配置项缺 enable（核心自己会 KeyError）",
+        ),
+        (
+            [_instance(_chat_entry("p0"))],
+            {"provider": "not-a-list"},
+            False,
+            "provider 段不是 list",
+        ),
+        (
+            [object()],
+            {"provider": [_chat_entry("p0")]},
+            False,
+            "实例读不到 id",
+        ),
+        (
+            [_instance(_chat_entry("p0")), _instance(_chat_entry("p0"))],
+            {"provider": [_chat_entry("p0")]},
+            False,
+            "同一 id 加载了两份（数量对不上）",
+        ),
+    ],
+)
+def test_78_prefilter_pure_function_requires_config_and_loaded_to_agree(
+    plugin_module, loaded, config, expected, reason
+):
+    """``prefilter_proves_support`` 真值表：**配置与加载表一致**才算证明。
+
+    单独扫 ``get_all_providers()`` 不够：``terminate_provider`` 里实例先被移出
+    ``provider_insts``（4.29.1 ``manager.py:883``）、``await terminate()`` 之后才
+    ``del inst_map``（``:908``），窗口期 ``get_all_providers()`` 看不到它、核心却仍能解析到它。
+    这里把"少一个/多一个/两边都空"逐条钉住，任何一条漏判都会让 R7 §3.4 的误放行回来。
+    """
+    assert plugin_module.prefilter_proves_support(loaded, config) is expected, reason
+
+
+#: terminate 窗口的三种真实形态（都按 4.29.1 ``ProviderManager`` 的字段造，见
+#: ``race_window.py`` 的输出）。每条给出 ``(加载表, 配置条目, 核心解析到的实例, 说明)``：
+#:
+#: - ``provider_insts`` 是"已加载的 chat provider"（= ``get_all_providers()``）；
+#: - 配置条目仍然列着被移除的那个（``delete_provider`` 是**先** terminate 再改配置，
+#:   ``manager.py:925-928``）；
+#: - ``get_using_provider_async`` 仍返回它（``inst_map.get`` 要到 ``:908`` 才失效）。
+_WINDOW_CASES = {
+    "multi": (
+        [_chat_entry("p-good", ["text", "tool_use"])],
+        [
+            _chat_entry("p-good", ["text", "tool_use"]),
+            _chat_entry("p-bad", ["text"]),
+        ],
+        _chat_entry("p-bad", ["text"]),
+        "多 provider：被移除的那个是 offender",
+    ),
+    "single": (
+        [],
+        [_chat_entry("p-bad", ["text"])],
+        _chat_entry("p-bad", ["text"]),
+        "单 provider：provider_insts 短暂为空（真空真）",
+    ),
+    "update": (
+        [_chat_entry("p-good", ["text", "tool_use"])],
+        [
+            _chat_entry("p-good", ["text", "tool_use"]),
+            # 配置刚被改成"支持"，但 inst_map 里还是旧那个 offender 实例
+            _chat_entry("p-bad", ["text", "tool_use"]),
+        ],
+        _chat_entry("p-bad", ["text"]),
+        "update：配置已改成支持，解析到的仍是旧实例",
+    ),
+}
+
+
+@pytest.mark.parametrize("window", sorted(_WINDOW_CASES))
+@pytest.mark.parametrize("prefilter_available", [True, False])
+def test_79_terminate_window_cannot_be_skipped_by_the_prefilter(
+    plugin_module, hook, logs, window, prefilter_available
+):
+    """provider 重载的 ``terminate`` 窗口里，预筛**不得**跳过 DB 点查并放行。
+
+    R7 §3.4 在真 4.29.1 上复现过：窗口期预筛判"支持"→ 跳过点查 → 把工具注入给一个声明
+    "不支持工具"的 provider（4.23.0–4.23.4 上工具会被真的发出去）。本用例把这个状态搬到
+    替身上（``all_providers`` 与 ``provider`` 本来就是两个可分别构造的源），并要求：
+
+    1. 预筛可用 / 不可用（``Context`` 没有 ``get_all_providers``）两种情况下结果**完全一致**；
+    2. 都必须真的查一次 provider（``prefilter_skipped_db`` 不得为真）；
+    3. 都不注入、都只出一条"未勾 tool_use"的 WARNING、都没有 ERROR。
+    """
+    loaded_entries, config_entries, resolved_entry, reason = _WINDOW_CASES[window]
+    #: 预筛"不可用"这一臂 = ``Context`` 根本没有 ``get_all_providers``（旧核心/替身）。
+    loaded = (
+        [_instance(entry) for entry in loaded_entries] if prefilter_available else None
+    )
+    plugin, _, context, _ = make_plugin(
+        plugin_module,
+        kb_names=["kb1"],
+        provider=_instance(resolved_entry),
+        provider_api=("async",),
+        all_providers=loaded,
+        provider_configs=config_entries,
+    )
+
+    req = stub.ProviderRequest()
+    hook(plugin, req)
+
+    assert context.provider_calls == ["async:aiocqhttp:FriendMessage:10086"], (
+        f"[{reason}] 窗口期必须查一次 provider：预筛在这里只能'证明不了'"
+    )
+    assert req.func_tool is None, f"[{reason}] 预筛不得把'明确不支持'放行"
+    warnings = messages(logs, logging.WARNING)
+    assert len(warnings) == 1 and "tool_use" in warnings[0]
+    assert messages(logs, logging.ERROR) == []
+    if prefilter_available:
+        assert context.all_providers_calls == 1, "预筛本身确实被问过一次（不是没走到）"
 
 
 def test_27_non_standard_func_tool_warns_once_and_skips_injection(
@@ -1705,19 +1998,20 @@ def test_54_injection_debug_does_not_invent_a_provider_when_none_was_judged(
     assert "判定对象=未查询（respect_provider_tool_support=false）" in text
     assert "stale/p" not in text, "开关关闭时不该出现任何 provider 名（那是编造）"
 
-    # (b) 静态预筛命中（没人声明缺 tool_use → 判定必然为支持，无需查询）
+    # (b) 静态预筛命中（配置与加载表一致、没人声明缺 tool_use → 判定必然为支持，无需查询）
     logs.clear()
+    steady = FakeProvider({"id": "p-steady", "model": "m", "enable": True})
     plugin2, _, context2, _ = make_plugin(
         plugin_module,
         kb_names=["kb1"],
-        provider=FakeProvider({"id": "p-current", "model": "m"}),
+        provider=steady,
         provider_api=("async",),
-        all_providers=[FakeProvider({"id": "p0", "model": "m0"})],
+        all_providers=[steady],
     )
     hook(plugin2, stub.ProviderRequest())
     text2 = messages(logs, logging.DEBUG)[0]
     assert "判定对象=未查询（静态预筛" in text2
-    assert "p-current" not in text2, "预筛没查 provider，写具体名字等于编造"
+    assert "p-steady" not in text2, "预筛没查 provider，写具体名字等于编造"
     assert context2.provider_calls == []
 
 
