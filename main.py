@@ -70,11 +70,47 @@ _TRUE_TOKENS = frozenset({"1", "true", "yes", "on"})
 _FALSE_TOKENS = frozenset({"0", "false", "no", "off"})
 
 
-#: ``_unknown_logged`` 的上界。键里含 ``str(exc)[:80]``，只要上游异常消息带可变内容
-#: （端口、超时毫秒、umo、URL），每条都是一次新键 → set 会被**外部输入**无限喂大。
-#: 到顶后清空重来（而不是"不再记新键"）：旧原因被重新记一次只是多几条 DEBUG，而永久丢弃
-#: 新原因会让排障时看不到"当前真正在报什么"。
+#: "只报一次"去重集合的上界。键里含 ``str(exc)[:80]``，只要上游异常消息带可变内容
+#: （端口、超时毫秒、umo、URL），每条都是一次新键 → 集合会被**外部输入**无限喂大。
+#:
+#: 到顶后**不再放行新键**（不记日志、也不入集合），代价是排障时看不到"当前真正在报什么"；
+#: 换来的是**日志条数**也有上界（总数 ≤ 上界 + 1 条"已达上界"的提示）。此前是"到顶后清空
+#: 重来"，集合确实有上界，但 200 个互不相同的原因仍然产出 200 条日志 —— 集合上界不等于
+#: 日志上界。一次性提示把"看不见新原因"这件事说出来，比静默刷屏好。
 _UNKNOWN_LOG_CAP = 64
+
+
+class _OnceLog:
+    """有界的"只报一次"判据：同一个键放行一次，集合到顶后**不再放行**新键。
+
+    为什么不用裸 ``set`` + ``if key not in s``：那样只约束了内存，不约束日志条数。
+    为什么不在到顶后清空重来：清空会让日志条数重新变成"按请求数线性增长"（每个请求都能造
+    一个新键），而 R7 验收口径要的是"日志条数 ≤ 上界 + 1"。
+
+    ``saturated`` 让调用方能在**第一次**被拒时补一条一次性提示；``notified`` 保证那条提示
+    一个实例只出现一次。
+    """
+
+    def __init__(self, cap: int) -> None:
+        self._cap = cap
+        self._keys: set[str] = set()
+        #: 是否已经提示过"到上界了"。
+        self.notified = False
+
+    def claim(self, key: str) -> bool:
+        """该键是否**第一次**出现（``True`` = 调用方应该记这条日志）。"""
+        if key in self._keys or len(self._keys) >= self._cap:
+            return False
+        self._keys.add(key)
+        return True
+
+    @property
+    def saturated(self) -> bool:
+        """集合是否已达上界（此后新键都不会再被放行）。"""
+        return len(self._keys) >= self._cap
+
+    def __len__(self) -> int:
+        return len(self._keys)
 
 
 def parse_bool_setting(value: object) -> bool | None:
@@ -307,7 +343,11 @@ class KBSearchToolPlugin(Star):
         self._resolve_missing = False
         self._warned_no_kb = False
         self._warned_non_standard_tool_set = False
-        self._unknown_logged: set[str] = set()
+        #: "未知原因"（DEBUG）与"异常路径"（ERROR）各自的**有界**去重集合：
+        #: 每个原因只报一次，集合到顶后不再放行新原因 → 日志条数也有上界。
+        #: 分成两个是为了别让 DEBUG 噪音把 ERROR 的预算吃掉。
+        self._unknown_logged = _OnceLog(_UNKNOWN_LOG_CAP)
+        self._error_logged = _OnceLog(_UNKNOWN_LOG_CAP)
         #: "明确不支持工具"的 WARNING 去重键 ``(provider_id, model)``：用户切了模型要再说一次。
         self._warned_unsupported: set[tuple[str, str]] = set()
         #: 本次请求判定过的 provider（``(provider_id, model, 显示用标签)``）。
@@ -382,9 +422,10 @@ class KBSearchToolPlugin(Star):
         try:
             await self._ensure_tool(event, req)
         except Exception as exc:  # noqa: BLE001 - 异常类型不可预期
-            logger.error(
-                "[KBTool] 注入工具时异常，已跳过本次注入: %s", exc, exc_info=True
-            )
+            # 最后一道兜底：走到这里说明 _ensure_tool 里有个没被就地处理的 bug。同一原因
+            # 只报一次 —— 否则"每个请求一条带 traceback 的 ERROR"就会从这里复活，而
+            # CHANGELOG 明确承诺过没有这种路径。
+            self._log_tool_failure_once(exc)
 
     async def _ensure_tool(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
         self._judged_provider = None  # 清零：见 __init__ 里关于本次请求标签的说明
@@ -398,15 +439,21 @@ class KBSearchToolPlugin(Star):
         tool_set = req.func_tool
         if tool_set is not None:
             # 非标准 ``func_tool``（别的插件换成了缺 get_tool/add_tool 的对象）：0.2.0 会在
-            # 这里 AttributeError，被钩子外层吞成**每请求一条 ERROR + traceback**。那既是
-            # 唯一会无限刷 ERROR 的路径，也与 respect_provider_tool_support 毫无关系。
+            # 这里 AttributeError，被钩子外层吞成**每请求一条 ERROR + traceback**。
             # 现在改为：一次性 WARNING（说清是谁的形状不对）+ 跳过注入，绝不抛异常。
             get_tool = getattr(tool_set, "get_tool", None)
             add_tool = getattr(tool_set, "add_tool", None)
             if not callable(get_tool) or not callable(add_tool):
                 self._warn_non_standard_tool_set_once(tool_set)
                 return
-            if get_tool(KB_TOOL_NAME) is not None:
+            # 形状对、但一调用就抛：0.2.0 也是每请求一条 ERROR。这里就地兜住并只报一次，
+            # 异常不冒泡（冒到外层虽然也能吞掉，但那条兜底日志会按请求刷）。
+            try:
+                existing = get_tool(KB_TOOL_NAME)
+            except Exception as exc:  # noqa: BLE001 - 第三方对象的异常类型不可预期
+                self._log_tool_failure_once(exc)
+                return
+            if existing is not None:
                 # 核心 agentic 模式或别的钩子已加过：不重复添加，也不替换别人的实例。
                 return
 
@@ -445,7 +492,12 @@ class KBSearchToolPlugin(Star):
         if tool_set is None:  # 纯对话没有别的工具时核心给的就是 None，不新建等于缺席
             req.func_tool = ToolSet()
             tool_set = req.func_tool
-        tool_set.add_tool(tool)
+        try:
+            tool_set.add_tool(tool)
+        except Exception as exc:  # noqa: BLE001 - 第三方对象的异常类型不可预期
+            # 与 get_tool 同一类：形状对但会抛。异常不冒泡，同一原因只报一次。
+            self._log_tool_failure_once(exc)
+            return
         # 日志取值也不假设一定有 ``tools``：func_tool 可能被别的插件换成自定义对象。
         tool_count = len(getattr(tool_set, "tools", ()))
         # 带上"判定对象"：用户按 README 调 DEBUG 排障时，要能一眼看出这次判的是哪个
@@ -453,6 +505,32 @@ class KBSearchToolPlugin(Star):
         logger.debug(
             "[KBTool] 注入 %s，工具数=%d，判定对象=%s", KB_TOOL_NAME, tool_count, judged
         )
+
+    def _log_tool_failure_once(self, exc: BaseException) -> None:
+        """``func_tool`` 的 ``get_tool``/``add_tool`` 抛异常：**同一原因只报一次** ERROR。
+
+        为什么不能每请求一条（0.2.0 的行为）：这类对象只要还在，每个请求都会抛同一条异常，
+        于是"每请求一条带 traceback 的 ERROR"就成了一条真正的刷屏路径 —— 而 CHANGELOG 里
+        "本插件没有会无限刷 ERROR 的路径"这句话必须成立。异常本身仍然**不冒泡**（fail-open：
+        最坏只是这次不注入）。
+
+        去重键 = 异常类型 + 消息前 80 字：同类型不同原因各留一条（排障时要看到真正的原因），
+        长度有上界（键不会无限长），条数也有上界（``_error_logged`` 到顶后不再放行新键）。
+        """
+        key = f"toolop:{type(exc).__name__}:{str(exc)[:80]}"
+        if self._error_logged.claim(key):
+            logger.error(
+                "[KBTool] 注入工具时异常，已跳过本次注入（同一原因只报一次）: %s",
+                exc,
+                exc_info=True,
+            )
+            return
+        if self._error_logged.saturated and not self._error_logged.notified:
+            self._error_logged.notified = True
+            logger.error(
+                "[KBTool] 注入异常的原因已达 %d 种，后续新原因不再记录（注入仍会继续尝试）。",
+                _UNKNOWN_LOG_CAP,
+            )
 
     def _warn_non_standard_tool_set_once(self, tool_set: object) -> None:
         """非标准 ``func_tool``（缺 ``get_tool``/``add_tool``）：一次性 WARNING + 跳过注入。
@@ -531,8 +609,13 @@ class KBSearchToolPlugin(Star):
                 return bool(session_cfg.get("kb_ids"))
             return bool(self.context.get_config(umo=umo).get("kb_names") or [])
         except Exception as exc:  # noqa: BLE001 - 见 docstring 的 fail-open
-            # 用 debug 而非 warning：持续失败会每请求一条；排障时把插件日志调到 DEBUG 即可。
-            logger.debug("[KBTool] 判定知识库可用性失败，按可用处理: %s", exc)
+            # 用 debug 而非 warning（默认 INFO 下不可见）；同一原因只记一次 —— 数据库锁死
+            # 或配置读坏时每个请求都会抛同一句话，逐次打就是"每请求一条 DEBUG"。
+            self._log_unknown_once(
+                f"kb:{type(exc).__name__}:{str(exc)[:80]}",
+                "[KBTool] 判定知识库可用性失败，按可用处理: %s",
+                exc,
+            )
             return True
 
     def _static_prefilter_proves_support(self, event: AstrMessageEvent) -> bool:
@@ -682,21 +765,35 @@ class KBSearchToolPlugin(Star):
             return True, getter(umo=umo)
         return False, None
 
+    def _log_unknown_once(self, key: str, template: str, exc: object) -> None:
+        """ "未知原因"的 DEBUG：同一个键只放行一次，键集合与日志条数都有上界。
+
+        键里含 ``str(exc)[:80]``：上游只要给出带可变内容的异常（端口、超时毫秒、umo、URL），
+        每次请求都能造出一个新键。``_unknown_logged`` 的上界（``_UNKNOWN_LOG_CAP``）管住内存，
+        "到顶后不再放行新键"管住**日志条数**（≤ 上界 + 1 条一次性提示）。这只影响"同一条
+        DEBUG 会不会再出现一次"，不影响任何判定结果。
+        """
+        if self._unknown_logged.claim(key):
+            logger.debug(template, exc)
+            return
+        if self._unknown_logged.saturated and not self._unknown_logged.notified:
+            self._unknown_logged.notified = True
+            logger.debug(
+                "[KBTool] 未判定/失败原因已达 %d 种，后续新原因不再记录（判定与注入不受影响）。",
+                _UNKNOWN_LOG_CAP,
+            )
+
     def _assume_supported(self, key: str, reason: str) -> bool:
         """fail-open：按"支持工具"处理，同一个原因只 DEBUG 一次（返回值恒为 True）。
 
-        ``_unknown_logged`` 有上界（``_UNKNOWN_LOG_CAP``）：键里含异常消息摘要，上游只要给出
-        带可变内容的异常（端口、超时毫秒、umo、URL），每次请求都能造出一个新键。到顶就清空
-        重来 —— 这只影响"同一条 DEBUG 会不会再出现一次"，不会影响任何判定结果。
+        去重与上界见 ``_log_unknown_once``：同类型不同原因各留一条，超过上界后不再新增日志，
+        但**返回值恒为 True**，判定结果与是否记录日志无关。
         """
-        if key not in self._unknown_logged:
-            if len(self._unknown_logged) >= _UNKNOWN_LOG_CAP:
-                self._unknown_logged.clear()
-            self._unknown_logged.add(key)
-            logger.debug(
-                "[KBTool] 无法判定当前 provider 是否支持工具调用（%s），按支持处理。",
-                reason,
-            )
+        self._log_unknown_once(
+            f"probe:{key}",
+            "[KBTool] 无法判定当前 provider 是否支持工具调用（%s），按支持处理。",
+            reason,
+        )
         return True
 
     def _warn_unsupported_once(self, provider: object, config: dict) -> None:

@@ -410,7 +410,12 @@ def test_08_resolve_failure_is_contained_then_self_heals(plugin_module, hook, lo
 
 
 def test_09_injection_exception_does_not_escape_the_hook(plugin_module, hook, logs):
-    """注入过程中抛异常 → 不打断对话，只留一条 ERROR。"""
+    """``add_tool`` 抛异常 → 不打断对话，**同一原因只留一条 ERROR**（3 次请求 → 1 条）。
+
+    R7 §7 实测 R7 前是 3 次请求 3 条 ERROR（每条带 traceback）—— 这类对象只要还在，
+    每个请求都会抛同一条异常，于是"每请求一条 ERROR"就是一条真正的刷屏路径。现在：异常仍在
+    就地吞掉（不冒泡），但只报一次；后续请求照旧尝试注入。
+    """
 
     class ExplodingToolSet(stub.ToolSet):
         def add_tool(self, tool):
@@ -418,12 +423,66 @@ def test_09_injection_exception_does_not_escape_the_hook(plugin_module, hook, lo
 
     plugin, _, _, _ = make_plugin(plugin_module, kb_names=["kb1"])
 
-    req = stub.ProviderRequest(func_tool=ExplodingToolSet())
-    hook(plugin, req)  # 不抛即通过
+    for _ in range(3):
+        req = stub.ProviderRequest(func_tool=ExplodingToolSet())
+        hook(plugin, req)  # 不抛即通过
+        assert req.func_tool.tools == [], "抛了就不该留下半截注入"
 
     errors = messages(logs, logging.ERROR)
-    assert len(errors) == 1
+    assert len(errors) == 1, f"3 次同一原因只该 1 条 ERROR，实际 {errors}"
     assert "boom" in errors[0]
+    assert "只报一次" in errors[0], "文案要说清后面不再重复，否则用户以为日志丢了"
+
+
+def test_09b_get_tool_that_raises_is_logged_once_and_never_escapes(
+    plugin_module, hook, logs
+):
+    """``get_tool`` 抛异常（形状对、行为坏）→ 同样是"一次性 ERROR + 跳过 + 不冒泡"。
+
+    与缺 ``get_tool`` 那条不同：形状检查看不出来，只能靠就地 try/except。R7 §4 的 P3-d
+    实测这种对象每请求 1 条 ERROR（3/3）。
+    """
+
+    class ExplodingGet(stub.ToolSet):
+        def get_tool(self, name):
+            raise RuntimeError("get_tool boom")
+
+    plugin, _, context, _ = make_plugin(plugin_module, kb_names=["kb1"])
+
+    for _ in range(3):
+        req = stub.ProviderRequest(func_tool=ExplodingGet())
+        hook(plugin, req)  # 不抛即通过
+        assert req.func_tool.tools == []
+    assert context.provider_calls == [], "判重阶段就退出了，轮不到 provider 判定"
+
+    errors = messages(logs, logging.ERROR)
+    assert len(errors) == 1, f"3 次同一原因只该 1 条 ERROR，实际 {errors}"
+    assert "get_tool boom" in errors[0]
+
+
+def test_09c_tool_operation_errors_are_deduped_per_reason_not_per_type(
+    plugin_module, hook, logs
+):
+    """去重键含摘要：同类型不同原因各留一条，且都不冒泡、都不注入。"""
+
+    class Flaky(stub.ToolSet):
+        def __init__(self, message):
+            super().__init__()
+            self.message = message
+
+        def add_tool(self, tool):
+            raise RuntimeError(self.message)
+
+    plugin, _, _, _ = make_plugin(plugin_module, kb_names=["kb1"])
+    for message in ("first reason", "second reason", "second reason"):
+        req = stub.ProviderRequest(func_tool=Flaky(message))
+        hook(plugin, req)
+        assert req.func_tool.tools == []
+
+    errors = messages(logs, logging.ERROR)
+    assert len(errors) == 2, f"两种原因各一条，实际 {errors}"
+    assert any("first reason" in m for m in errors)
+    assert any("second reason" in m for m in errors)
 
 
 def test_10_conf_schema_and_metadata_are_valid():
@@ -463,6 +522,37 @@ def test_11_fail_open_when_session_get_raises(plugin_module, hook, sp):
 
     assert req.func_tool is not None
     assert req.func_tool.get_tool(plugin_module.KB_TOOL_NAME) is tool
+
+
+def test_11b_kb_probe_failure_is_logged_once_and_stays_fail_open(
+    plugin_module, hook, logs, sp
+):
+    """``sp.session_get`` 抛异常：**同一原因只记一条 DEBUG**，注入照旧 3/3。
+
+    R7 §7 实测：0.2.0 与 0.3.0 都是"每请求一条 DEBUG"（3 次请求 → 3 条）。数据库锁死、
+    配置读坏这类故障会持续存在，逐次打就是一条无上界的日志通道。改成按
+    "异常类型 + 消息前 80 字"去重：同一条异常只报一次，换一个原因再报一次（排障要能看到
+    真正的原因），总量另有上界（``_UNKNOWN_LOG_CAP``）。
+    """
+    sp.error = RuntimeError("database is locked")
+    plugin, _, _, tool = make_plugin(plugin_module, kb_names=[])
+
+    for _ in range(3):
+        req = stub.ProviderRequest()
+        hook(plugin, req)
+        assert req.func_tool is not None, "日志降噪绝不改变 fail-open"
+        assert req.func_tool.get_tool(plugin_module.KB_TOOL_NAME) is tool
+
+    probe = [m for m in messages(logs, logging.DEBUG) if "判定知识库可用性失败" in m]
+    assert len(probe) == 1, f"3 次同一异常只该 1 条，实际 {probe}"
+    assert "database is locked" in probe[0], "要留下真正的原因"
+    assert messages(logs, logging.ERROR) == []
+
+    # 换一个原因 → 再报一条（去重键含摘要，不是"只报一次就永远闭嘴"）。
+    sp.error = RuntimeError("database is locked (retry 2)")
+    hook(plugin, stub.ProviderRequest())
+    probe = [m for m in messages(logs, logging.DEBUG) if "判定知识库可用性失败" in m]
+    assert len(probe) == 2
 
 
 def test_12_fail_open_when_get_config_raises(plugin_module, hook):
@@ -2056,10 +2146,14 @@ def test_56_unknown_provider_case_says_where_to_look(plugin_module, hook, logs):
 
 
 def test_57_unknown_logged_is_bounded_at_64(plugin_module, hook, logs):
-    """``_unknown_logged`` 有上界：上游异常消息带可变内容时不会把集合无限喂大。
+    """``_unknown_logged`` 有上界：上游异常消息带可变内容时既不吃内存，也不刷日志。
 
     真实触发方式：异常消息里带端口/超时毫秒/umo/URL 时，每次请求都是一个新键。
     这里用 70 条互不相同的消息驱动 70 次请求。
+
+    R7 §5.4 的口径：**集合上界 64 不等于日志上界** —— 此前"到顶后清空重来"在 200 个不同
+    原因下产出 200 条 DEBUG。现在到顶后不再放行新键，于是 70 次请求 = 64 条原因 + 1 条
+    "已达上界"提示。
     """
     plugin, _, context, _ = make_plugin(
         plugin_module,
@@ -2075,13 +2169,73 @@ def test_57_unknown_logged_is_bounded_at_64(plugin_module, hook, logs):
         assert req.func_tool is not None, "去重集合满不满都不该影响 fail-open"
         assert len(plugin._unknown_logged) <= 64, "集合不得突破上界"
 
-    assert len(plugin._unknown_logged) == 70 - 64, (
-        "到顶后清空重来：第 65 条起从空集合重新记，最后剩 70-64=6 条"
-    )
+    assert len(plugin._unknown_logged) == 64, "到顶后不再收新键（不是清空重来）"
+    debug = messages(logs, logging.DEBUG)
+    assert sum("按支持处理" in m for m in debug) == 64, "只有前 64 个原因留下 DEBUG"
+    assert sum("不再记录" in m for m in debug) == 1, "到顶这件事要说一次，不能静默"
+    assert len([m for m in debug if "按支持处理" in m or "不再记录" in m]) == 65
     assert messages(logs, logging.ERROR) == []
-    assert sum("按支持处理" in m for m in messages(logs, logging.DEBUG)) == 70, (
-        "每条新原因仍然留下一条 DEBUG（清空只重置去重，不静默丢日志）"
+
+
+def test_57b_two_hundred_distinct_reasons_stay_within_the_declared_bound(
+    plugin_module, hook, logs
+):
+    """R7 §5.4 的验收口径：**200 个不同原因 → 原因日志 ≤ 65 条**（64 + 1 条提示）。
+
+    R7 实测修复前是 200 条（集合上界生效，但日志条数没有上界）。这条把口径钉死。
+    """
+    plugin, _, context, _ = make_plugin(
+        plugin_module,
+        kb_names=["kb1"],
+        provider_api=("async",),
+        provider_error=RuntimeError("reason-000-variable-tail"),
     )
+
+    for index in range(200):
+        context.provider_error = RuntimeError(f"reason-{index:03d}-variable-tail")
+        req = stub.ProviderRequest()
+        hook(plugin, req)
+        assert req.func_tool is not None, "日志上界绝不能影响 fail-open"
+
+    debug = messages(logs, logging.DEBUG)
+    reason_lines = [m for m in debug if "按支持处理" in m or "不再记录" in m]
+    assert len(reason_lines) <= 65, (
+        f"200 个不同原因只允许 ≤65 条，实际 {len(reason_lines)}"
+    )
+    assert sum("按支持处理" in m for m in debug) == 64
+    assert sum("不再记录" in m for m in debug) == 1
+    assert len(plugin._unknown_logged) == 64
+    assert messages(logs, logging.ERROR) == []
+
+
+def test_57c_debug_noise_does_not_starve_the_error_bucket(plugin_module, hook, logs):
+    """DEBUG 的 64 条预算被噪音占满后，ERROR 仍然照常记录（两个集合互不影响）。
+
+    如果共用同一个去重集合，一串"未知原因"就能把注入异常的 ERROR 全部挤掉 —— 那会让真正
+    需要看见的故障静默消失。
+    """
+
+    class ExplodingToolSet(stub.ToolSet):
+        def add_tool(self, tool):
+            raise RuntimeError("injection boom")
+
+    plugin, _, context, _ = make_plugin(
+        plugin_module,
+        kb_names=["kb1"],
+        provider_api=("async",),
+        provider_error=RuntimeError("reason-000"),
+    )
+    for index in range(70):
+        context.provider_error = RuntimeError(f"reason-{index:03d}")
+        hook(plugin, stub.ProviderRequest())
+    assert len(plugin._unknown_logged) == 64
+
+    for _ in range(3):
+        hook(plugin, stub.ProviderRequest(func_tool=ExplodingToolSet()))
+
+    errors = messages(logs, logging.ERROR)
+    assert len(errors) == 1, f"ERROR 预算与 DEBUG 噪音无关，实际 {errors}"
+    assert "injection boom" in errors[0]
 
 
 def test_58_no_kb_warning_says_it_is_reported_once_per_plugin(
