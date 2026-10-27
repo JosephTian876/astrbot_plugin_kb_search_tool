@@ -213,3 +213,65 @@ def test_42_tests_never_read_the_audit_docs():
             assert f'"{prefix}' not in text and f"'{prefix}" not in text, (
                 f"{path.name} 里用字符串常量引用了审计文档 {prefix}*.md"
             )
+
+
+def test_60_readme_has_a_symptom_first_troubleshooting_table():
+    """P2-2：README 要有一张「症状 → 先看哪里 → 最可能的原因」表。
+
+    为什么值得一条用例：面板 hint 已压到摘要，**唯一能读长文的地方就是 README**；
+    而用户是带着"工具没出现"来的，不是带着"我想读日志"来的。没有症状入口时，
+    最常见的结局是"插件没生效，但我不知道要去哪里看"。
+    """
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert "| 症状 |" in readme, "缺少症状表的表头"
+    assert "| 第一步看哪里 |" in readme
+    assert "| 最可能的原因 |" in readme
+    for symptom in (
+        "对话里模型完全不用工具",
+        "一次注入日志都没有",
+        "没有可用知识库",
+        "未勾选 tool_use",
+        "插件日志一行都没有",
+    ):
+        assert symptom in readme, f"症状表里缺这一行: {symptom}"
+
+    # 表格必须真的是一张 markdown 表：表头行 + 分隔行 + 至少 6 行数据。
+    lines = readme.splitlines()
+    header = next(i for i, line in enumerate(lines) if line.startswith("| 症状 |"))
+    assert lines[header + 1].startswith("|---"), "症状表缺少 markdown 分隔行"
+    rows = 0
+    for line in lines[header + 2 :]:
+        if not line.startswith("|"):
+            break
+        rows += 1
+    assert rows >= 6, f"症状表只有 {rows} 行，至少要覆盖 6 种症状"
+
+
+def test_61_readme_carries_the_full_judgement_that_left_the_panel_hint():
+    """P2-2：从 hint 里搬走的长文必须真的落在 README，而不是被删掉了。
+
+    面板 hint 的定位是"悬停时能读完的摘要"。摘要里保留的是**判据关键词**，细节（fail-open
+    的每一种形态、图片 fallback、只读承诺）只能在 README 里。这条用例保证"压缩"不是
+    "丢内容"。
+    """
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert "### 「尊重模型能力」的完整判据" in readme, "README 里没有完整判据小节"
+    for detail in (
+        "tool_use",
+        "非空 list",
+        "fail-open",
+        "不是 list",
+        "取不到 provider",
+        "抛异常",
+        "fallback provider",
+        "只读",
+    ):
+        assert detail in readme, f"完整判据里缺这一条: {detail}"
+
+    # 反向钉子：判据细节不该再塞回面板 hint（那会立刻超过 test_28 的长度上界）。
+    schema = json.loads((REPO_ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
+    respect_hint = schema["respect_provider_tool_support"]["hint"]
+    assert "fallback" not in respect_hint
+    assert "4.23" not in respect_hint

@@ -3,18 +3,19 @@
     "description": "启用知识库检索常驻",
     "type": "bool",
     "default": true,
-    "hint": "关闭后本插件完全不介入请求；模型是否有 astr_kb_search 只取决于核心的 kb_agentic_mode。"
+    "hint": "与在插件面板里「停用」等效；关闭后本插件不介入任何请求。"
   },
   "only_when_kb_configured": {
     "description": "仅在已配置知识库时注入",
     "type": "bool",
     "default": true,
-    "hint": "开启后按核心的判定顺序检查：先看当前会话的知识库设置（会话里选的 kb_ids），没有该设置时才看主配置 kb_names；两边都没有非空的知识库配置时不注入工具。注意：本项只看配置是否非空，不校验知识库是否存在或有内容。关闭后总是注入——若完全没有知识库，模型会拿到一个查不到内容的工具。另：核心的 kb_agentic_mode=true 时工具由核心自己添加，本项与 enable 都不改变结果。"
+    "hint": "只在会话或主配置里选了非空知识库时注入（会话级优先）；不校验知识库是否存在。关闭后总是注入。"
   },
   "respect_provider_tool_support": {
     "description": "尊重当前模型的工具能力声明",
     "type": "bool",
     "default": true,
-    "hint": "判据只有一条：当前会话实际使用的那个 provider 的「模型能力（modalities）」是**非空 list 且不含 tool_use** 时，才跳过注入并告警一次。其余情况一律按支持处理（放行注入）：modalities 为 None、空 list、没有这个键、不是 list、取不到 provider、读取 provider 抛异常——核心自己也把空值当「未配置，默认支持全部模态」。本判定只读配置，不改它。注意「配置 ≠ 真实能力」：模型其实支持函数调用、只是没勾 tool_use 时也会被跳过，此时把本项（respect_provider_tool_support）关掉即可恢复总是注入（0.2.0 旧行为）。另：图片请求可能被核心切换给 fallback provider，那种情况无法判定，会放行。"
+    "obvious_hint": true,
+    "hint": "「模型能力」非空且不含 tool_use 时跳过注入（告警一次），其余一律放行；判错就关掉 respect_provider_tool_support。"
   }
 }

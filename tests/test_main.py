@@ -1216,6 +1216,17 @@ def test_28_conf_schema_and_plugin_read_the_same_config_keys(plugin_module):
     assert "放行" in hint, "hint 必须写清未知/空值一律放行（fail-open）"
     assert "respect_provider_tool_support" in hint, "hint 要告诉用户关闭后回到旧行为"
 
+    # P2-2：hint 是"问号 hover 才显示"的悬浮提示，不是行内文档。写 619 个字没人读得完，
+    # 而真正的判据全文在 README §4。这里钉住两件事：单个 hint 短到能读完，judge 的关键
+    # 键（respect_provider_tool_support）用 obvious_hint 把 ‼️ 显示出来。
+    # 上界的依据：面板 hint 弹层一行约 40 汉字，两行 ≈ 80 字；超了就不再是"提示"。
+    assert len(hint) <= 80, f"hint {len(hint)} 字太长，长文应放 README §4"
+    assert item.get("obvious_hint") is True, "关键键要显式标记（面板会显示 ‼️）"
+    assert len(schema["only_when_kb_configured"]["hint"]) <= 60
+    assert len(schema["enable"]["hint"]) <= 40
+    total = sum(len(entry["hint"]) for entry in schema.values())
+    assert total <= 200, f"三个 hint 合计 {total} 字；压缩前是 619 字"
+
     # 默认值：三个键都从默认配置读出 True。
     plugin, _, _, _ = make_plugin(plugin_module)
     assert plugin.enabled is True
@@ -1278,8 +1289,11 @@ def test_29_switch_off_is_observably_identical_to_0_2_0(
     if kb_names:
         assert req.func_tool is not None
         assert req.func_tool.get_tool(plugin_module.KB_TOOL_NAME) is tool
+        # 逐字断言：开关关闭时这一行与 0.2.0 的**唯一**差异就是末尾多了"判定对象=..."，
+        # 而且它诚实地写着"未查询"（因为确实一次都没查）。级别、条数、前面那段文案都不变。
         assert messages(logs, logging.DEBUG) == [
-            f"[KBTool] 注入 {plugin_module.KB_TOOL_NAME}，工具数=1"
+            f"[KBTool] 注入 {plugin_module.KB_TOOL_NAME}，工具数=1，"
+            "判定对象=未查询（respect_provider_tool_support=false）"
         ]
         assert messages(logs, logging.WARNING) == []
     else:
@@ -1591,3 +1605,176 @@ def test_37b_exception_summary_is_truncated_to_80_chars(plugin_module, hook, log
         message for message in messages(logs, logging.DEBUG) if "按支持处理" in message
     ]
     assert len(debug) == 1, "前 80 字相同时应视为同一原因（键不能无限增长）"
+
+
+# ---------------------------------------------------------------------------
+# 日志卫生（P2-4）
+#
+# 三件事：去重集合有上界（不能被外部输入喂大）、"只报一次"的文案要诚实、注入成功的
+# DEBUG 要说清"判的是谁"。第三条只在真的查过 provider 时才有答案 —— 没查就写"未查询"，
+# 绝不编造。
+# ---------------------------------------------------------------------------
+
+
+def test_53_injection_debug_names_the_provider_that_was_judged(
+    plugin_module, hook, logs
+):
+    """注入成功的 DEBUG 带 provider/model：排障时一眼看到"判的是谁"。"""
+    plugin, _, _, _ = make_provider_case(plugin_module, ["text", "tool_use"])
+
+    req = stub.ProviderRequest()
+    hook(plugin, req)
+
+    debug = messages(logs, logging.DEBUG)
+    assert len(debug) == 1
+    assert f"[KBTool] 注入 {plugin_module.KB_TOOL_NAME}，工具数=1，" in debug[0]
+    assert "判定对象=siliconflow/qwen3-vl-30b-a3b（模型 qwen3-vl-30b-a3b）" in debug[0]
+
+
+def test_54_injection_debug_does_not_invent_a_provider_when_none_was_judged(
+    plugin_module, hook, logs
+):
+    """没查 provider 时写"未查询"并给原因，而不是拿上次的结果或猜一个。
+
+    两种没查的情况都覆盖：开关关闭、静态预筛命中 —— 两者的原因文案不同，且都不含
+    任何 provider id。
+    """
+    # (a) 开关关闭
+    plugin, _, _, _ = make_plugin(
+        plugin_module,
+        kb_names=["kb1"],
+        config={"respect_provider_tool_support": False},
+        provider=FakeProvider({"id": "stale/p", "model": "stale-m"}),
+        provider_api=("async",),
+    )
+    hook(plugin, stub.ProviderRequest())
+    text = messages(logs, logging.DEBUG)[0]
+    assert "判定对象=未查询（respect_provider_tool_support=false）" in text
+    assert "stale/p" not in text, "开关关闭时不该出现任何 provider 名（那是编造）"
+
+    # (b) 静态预筛命中（没人声明缺 tool_use → 判定必然为支持，无需查询）
+    logs.clear()
+    plugin2, _, context2, _ = make_plugin(
+        plugin_module,
+        kb_names=["kb1"],
+        provider=FakeProvider({"id": "p-current", "model": "m"}),
+        provider_api=("async",),
+        all_providers=[FakeProvider({"id": "p0", "model": "m0"})],
+    )
+    hook(plugin2, stub.ProviderRequest())
+    text2 = messages(logs, logging.DEBUG)[0]
+    assert "判定对象=未查询（静态预筛" in text2
+    assert "p-current" not in text2, "预筛没查 provider，写具体名字等于编造"
+    assert context2.provider_calls == []
+
+
+def test_55_injection_debug_has_no_stale_label_after_a_judged_request(
+    plugin_module, hook, logs
+):
+    """先跑一次"判过 provider"的请求，再跑一次"没判"的请求：标签不得残留。"""
+    plugin, _, context, _ = make_plugin(
+        plugin_module,
+        kb_names=["kb1"],
+        config={"respect_provider_tool_support": False},
+        provider=FakeProvider({"id": "p-first", "model": "m-first"}),
+        provider_api=("async",),
+    )
+    # 手工先把标签写脏，模拟"上一次请求判过 p-first"。
+    plugin._judged_provider = ("p-first", "m-first", "p-first（模型 m-first）")
+
+    hook(plugin, stub.ProviderRequest())
+
+    text = messages(logs, logging.DEBUG)[0]
+    assert "p-first" not in text, "上一次请求的 provider 不能漏进这一次的日志"
+    assert "判定对象=未查询（respect_provider_tool_support=false）" in text
+    assert context.provider_calls == []
+
+
+def test_56_unknown_provider_case_says_where_to_look(plugin_module, hook, logs):
+    """查到了但没有 provider（None）→ 标签写"未知（原因见上一条 DEBUG）"，不写编造的名字。"""
+    plugin, _, _, _ = make_plugin(
+        plugin_module,
+        kb_names=["kb1"],
+        provider=None,
+        provider_api=("async",),
+    )
+
+    hook(plugin, stub.ProviderRequest())
+
+    debug = messages(logs, logging.DEBUG)
+    assert sum("按支持处理" in message for message in debug) == 1
+    injected = [message for message in debug if "注入" in message]
+    assert len(injected) == 1
+    assert "判定对象=未知（原因见上一条 DEBUG）" in injected[0]
+
+
+def test_57_unknown_logged_is_bounded_at_64(plugin_module, hook, logs):
+    """``_unknown_logged`` 有上界：上游异常消息带可变内容时不会把集合无限喂大。
+
+    真实触发方式：异常消息里带端口/超时毫秒/umo/URL 时，每次请求都是一个新键。
+    这里用 70 条互不相同的消息驱动 70 次请求。
+    """
+    plugin, _, context, _ = make_plugin(
+        plugin_module,
+        kb_names=["kb1"],
+        provider_api=("async",),
+        provider_error=RuntimeError("reason-000"),
+    )
+
+    for index in range(70):
+        context.provider_error = RuntimeError(f"reason-{index:03d}")
+        req = stub.ProviderRequest()
+        hook(plugin, req)
+        assert req.func_tool is not None, "去重集合满不满都不该影响 fail-open"
+        assert len(plugin._unknown_logged) <= 64, "集合不得突破上界"
+
+    assert len(plugin._unknown_logged) == 70 - 64, (
+        "到顶后清空重来：第 65 条起从空集合重新记，最后剩 70-64=6 条"
+    )
+    assert messages(logs, logging.ERROR) == []
+    assert sum("按支持处理" in m for m in messages(logs, logging.DEBUG)) == 70, (
+        "每条新原因仍然留下一条 DEBUG（清空只重置去重，不静默丢日志）"
+    )
+
+
+def test_58_no_kb_warning_says_it_is_reported_once_per_plugin(
+    plugin_module, hook, logs
+):
+    """``_warned_no_kb`` 是**全局一次**，文案必须说清楚，否则第二个会话静默失败。
+
+    旧文案只写"当前会话与主配置都没有可用知识库"，读者会以为"每个会话各报一次"。
+    实测：第一个会话报过之后，别的会话遇到同样情况是**不会**再报的。
+    """
+    plugin, _, _, _ = make_plugin(plugin_module, kb_names=[])
+
+    for umo in (
+        "aiocqhttp:FriendMessage:1",
+        "aiocqhttp:GroupMessage:2",
+        "aiocqhttp:FriendMessage:3",
+    ):
+        hook(plugin, stub.ProviderRequest(), umo=umo)
+
+    warnings = messages(logs, logging.WARNING)
+    assert len(warnings) == 1, "跨会话也只有一条（这就是必须把文案写诚实的原因）"
+    assert "只提示一次" in warnings[0], "文案要说明它是全局一次，而不是每会话一次"
+    assert "only_when_kb_configured" in warnings[0], "仍然要给出自救开关"
+
+
+def test_59_describe_provider_falls_back_readably(plugin_module):
+    """``describe_provider`` 的兜底：缺 id / 缺 model / 没有 provider_config 都要可读。"""
+
+    class Bare:
+        pass
+
+    cases = [
+        (FakeProvider({"id": "p", "model": "m"}), ("p", "m", "p（模型 m）")),
+        (
+            FakeProvider({"model": "m"}),
+            ("FakeProvider@m", "m", "FakeProvider@m（模型 m）"),
+        ),
+        (FakeProvider({"id": "p"}), ("p", "<未配置>", "p（模型 <未配置>）")),
+        (Bare(), ("Bare@None", "<未配置>", "Bare@None（模型 <未配置>）")),
+        (None, ("NoneType@None", "<未配置>", "NoneType@None（模型 <未配置>）")),
+    ]
+    for provider, expected in cases:
+        assert plugin_module.describe_provider(provider) == expected

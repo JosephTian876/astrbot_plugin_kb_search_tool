@@ -81,17 +81,51 @@
 - 新增 DEBUG（未知原因，按原因去重、每插件生命周期一次）：
   `[KBTool] 无法判定当前 provider 是否支持工具调用（<原因>），按支持处理。`
   去重键是「异常类型 + 消息前 80 字」：同类型不同原因各留一条，不会只看到第一条。
+  该去重集合**有 64 条上界**：键里含异常消息摘要，上游只要给出带可变内容的消息（端口、
+  超时毫秒、umo、URL），每条都是一次新键 —— 上界防止它被外部输入无限喂大。到顶后清空
+  重来（只影响"同一条 DEBUG 会不会再出现一次"，不影响任何判定）。
 - 新增 WARNING（加载期各一次）：配置项的值无法识别（回落默认值）、配置里有无法识别的键。
 - 新增 WARNING（每插件生命周期一次）：内置工具注册表返回 `None`（没抛异常）—— 此前是零日志
   静默失效。它与"抛异常"那条 ERROR 的文案不同：前者是名字没登记，后者是注册表/导入坏了。
-- 启动 INFO 与「注入成功」DEBUG 不变（`test_01` 仍断言成功路径恰好 1 条 DEBUG）。
+- 「无可用知识库」那条 WARNING 的文案补上「**本条每个插件生命周期只提示一次**」。它一直是
+  全局一次（不是每会话一次），旧文案只写"当前会话与主配置都没有可用知识库"，读者会以为
+  第二个会话还会再报一条 —— 实际是静默的。
+- 「注入成功」的 DEBUG 补上判定对象：
+  `[KBTool] 注入 astr_kb_search，工具数=N，判定对象=<provider id>（模型 <model>）`。
+  没查 provider 时**不编造**，写明原因：`未查询（respect_provider_tool_support=false）`、
+  `未查询（静态预筛：已加载 provider 均未声明缺 tool_use）`、`未知（原因见上一条 DEBUG）`。
+  （该行只在 DEBUG 级可见；默认 INFO 下开关关闭时的日志与 0.2.0 完全一致。）
+- 启动 INFO 不变（`test_01` 仍断言成功路径恰好 1 条 DEBUG）。
+
+### 性能
+
+- **静态预筛（O1）**：provider 闸门前先扫一遍已加载的 chat provider（`context.get_all_providers()`，
+  纯内存）。若没有任何一个声明「非空且缺 `tool_use`」，那么无论核心这次解析到哪个 provider，
+  判定都只能是"支持"，于是那次数据库点查被整段跳过。
+  - 实测（真 4.29.1 + 真 SQLite，5 轮交替取同轮配对差的中位数，见
+    `work\kb-030-artifacts\bench_p2_1_prefilter.py`）：provider 闸门单独
+    **1.1247 ms → 0.0026 ms**（省 1.1222 ms/请求）；两个闸门都开时 **2.1638 ms → 1.1296 ms**
+    （省 1.0462 ms/请求，剩下的 1.13 ms 是知识库那次查询，本版不动它）。
+  - 保守性：预筛只可能"退回查 DB"，**不会误放行**。会话级 `selected_provider` 存在时直接
+    不做预筛（它可能解析到 `get_all_providers()` 里没有的非 chat provider）；`get_all_providers`
+    缺失、抛异常、返回值不可迭代，或任一 provider 声明了 `tool_use` 缺失，都照旧走完整判定。
+  - 不新增任何日志、不改变任何判定结果：静默预筛，命中与否只看"有没有那次点查"。
 
 ### 配置与文档
 
-- `_conf_schema.json` 新增 `respect_provider_tool_support`（`bool`，默认 `true`，hint 写明
-  判据是「`modalities` 非空且不含 `tool_use`」、未知/空值一律放行、关闭后回到旧行为）。
-- README：配置表新增一行；「自查」补两条日志的含义；「边界」补 `modalities` 的跨版本语义、
-  4.23–4.26 的同步回退、图片 fallback；「与核心的关系」「版本兼容」同步。
+- `_conf_schema.json` 新增 `respect_provider_tool_support`（`bool`，默认 `true`）。
+- 面板 `hint` 重新定位为"**问号按钮悬停时能读完的摘要**"：三个 hint 从合计 619 字压到
+  **150 字**（`respect_provider_tool_support` 76 字 / `only_when_kb_configured` 46 字 /
+  `enable` 28 字），判据全文移到 README「配置项」下的「完整判据」小节。关键项
+  `respect_provider_tool_support` 加 `"obvious_hint": true`（面板会显示 ‼️）。
+  合法性已在两个版本上核对：4.23.0 与 4.29.x 的 dashboard 都读 `obvious_hint`
+  （`dashboard/src/components/shared/AstrBotConfig.vue`），而核心的
+  `AstrBotConfig._config_schema_to_default_config` 只读 `type`/`default`/`items`，
+  多余字段不会被拒绝（4.23.0 同款实现）。
+- README：配置表新增一行；新增「完整判据」小节；「自查」补两条日志的含义与一张
+  **「症状 → 排查三步」**表（症状优先，用户是带着"工具没出现"来的）；
+  「边界」补 `modalities` 的跨版本语义、4.23–4.26 的同步回退、图片 fallback；
+  「与核心的关系」「版本兼容」同步，并说明静态预筛。
 - README「配置项」补一段取值约定（哪些写法算布尔值、认不出会怎样、键名拼错会怎样）。
 
 ### 测试

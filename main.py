@@ -51,6 +51,13 @@ _TRUE_TOKENS = frozenset({"1", "true", "yes", "on"})
 _FALSE_TOKENS = frozenset({"0", "false", "no", "off"})
 
 
+#: ``_unknown_logged`` 的上界。键里含 ``str(exc)[:80]``，只要上游异常消息带可变内容
+#: （端口、超时毫秒、umo、URL），每条都是一次新键 → set 会被**外部输入**无限喂大。
+#: 到顶后清空重来（而不是"不再记新键"）：旧原因被重新记一次只是多几条 DEBUG，而永久丢弃
+#: 新原因会让排障时看不到"当前真正在报什么"。
+_UNKNOWN_LOG_CAP = 64
+
+
 def parse_bool_setting(value: object) -> bool | None:
     """把配置里的布尔值解析成 ``bool``；认不出返回 ``None``（由调用方回落到默认值）。
 
@@ -138,6 +145,22 @@ def selected_provider_id(event: object) -> str | None:
     return selected if isinstance(selected, str) and selected else None
 
 
+def describe_provider(provider: object) -> tuple[str, str, str]:
+    """``(provider_id, model, 显示用标签)``：从 provider 的配置里取，取不到给可读兜底。
+
+    只给日志用，**不参与任何判定**。``provider_id`` 缺失时用 ``"<类名>@<model>"`` 兜底 —
+    与"明确不支持"那条 WARNING 的兜底同形，用户在两行日志里看到的是同一个名字。
+    """
+    config = getattr(provider, "provider_config", None)
+    config = config if isinstance(config, dict) else {}
+    model = config.get("model")
+    provider_id = config.get("id")
+    if not isinstance(provider_id, str) or not provider_id:
+        provider_id = f"{type(provider).__name__}@{model}"
+    model_text = "<未配置>" if model in (None, "") else str(model)
+    return provider_id, model_text, f"{provider_id}（模型 {model_text}）"
+
+
 class KBSearchToolPlugin(Star):
     """把内置的知识库检索工具常驻到每次 LLM 请求。"""
 
@@ -163,6 +186,14 @@ class KBSearchToolPlugin(Star):
         self._unknown_logged: set[str] = set()
         #: "明确不支持工具"的 WARNING 去重键 ``(provider_id, model)``：用户切了模型要再说一次。
         self._warned_unsupported: set[tuple[str, str]] = set()
+        #: 本次请求判定过的 provider（``(provider_id, model, 显示用标签)``）。
+        #: 只用于"注入成功"那条 DEBUG 里的"判定对象=..."，让用户排障时一眼看到判的是谁。
+        #:
+        #: 为什么这里用实例状态是安全的：写入发生在 ``_provider_tool_support`` 里最后一次
+        #: ``await`` **之后**，读取发生在 ``_ensure_tool`` 的下一行 —— 中间没有任何 await 点，
+        #: 而 asyncio 只在 await 处切换任务，所以不会串到别的会话上。进入 ``_ensure_tool``
+        #: 时先置 ``None``，保证开关关闭/预筛命中时不会残留上一次请求的标签。
+        self._judged_provider: tuple[str, str, str] | None = None
 
         logger.info("[KBTool] 已加载 | 启用=%s | 工具=%s", self.enabled, KB_TOOL_NAME)
         # 启动即解析一次，让"核心没注册该工具"当场暴露，而不是等第一个请求静默不注入。
@@ -232,6 +263,7 @@ class KBSearchToolPlugin(Star):
             )
 
     async def _ensure_tool(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
+        self._judged_provider = None  # 清零：见 __init__ 里关于本次请求标签的说明
         if not self.enabled:  # 关闭时彻底不介入，痕迹只有启动那行"启用=False"
             return
 
@@ -250,18 +282,27 @@ class KBSearchToolPlugin(Star):
                 logger.warning(
                     "[KBTool] 当前会话与主配置都没有可用知识库，已跳过注入工具；"
                     "如需强制注入请关闭 only_when_kb_configured。"
+                    "（本条每个插件生命周期只提示一次：之后别的会话遇到同样情况不再重复。）"
                 )
             return
 
         # 放在最后一步之前：只有"确实要注入"的请求才付这次判定成本（知识库判定更常见）。
         if self.respect_provider_tool_support:
             # O1 静态预筛：已加载的 chat provider 里没人声明"缺 tool_use"时，无论核心这次
-            # 解析到哪一个，判定结果都只能是"支持" —— 那次 DB 点查（实测约 1.36 ms）可以
+            # 解析到哪一个，判定结果都只能是"支持" —— 那次 DB 点查（实测约 1.12 ms）可以
             # 整段跳过。预筛证明不了就照旧查一次，绝不改变"判定为不支持"的语义。
-            if not self._static_prefilter_proves_support(event) and (
-                not await self._provider_tool_support(event, req)
-            ):
-                return
+            if self._static_prefilter_proves_support(event):
+                judged = "未查询（静态预筛：已加载 provider 均未声明缺 tool_use）"
+            else:
+                if not await self._provider_tool_support(event, req):
+                    return
+                judged = (
+                    self._judged_provider[2]
+                    if self._judged_provider is not None
+                    else "未知（原因见上一条 DEBUG）"
+                )
+        else:
+            judged = "未查询（respect_provider_tool_support=false）"
 
         if tool_set is None:  # 纯对话没有别的工具时核心给的就是 None，不新建等于缺席
             req.func_tool = ToolSet()
@@ -269,7 +310,11 @@ class KBSearchToolPlugin(Star):
         tool_set.add_tool(tool)
         # 日志取值也不假设一定有 ``tools``：func_tool 可能被别的插件换成自定义对象。
         tool_count = len(getattr(tool_set, "tools", ()))
-        logger.debug("[KBTool] 注入 %s，工具数=%d", KB_TOOL_NAME, tool_count)
+        # 带上"判定对象"：用户按 README 调 DEBUG 排障时，要能一眼看出这次判的是哪个
+        # provider/model，而不是只知道"注入了"。没查时不编造，写明原因。
+        logger.debug(
+            "[KBTool] 注入 %s，工具数=%d，判定对象=%s", KB_TOOL_NAME, tool_count, judged
+        )
 
     def _resolve_tool(self) -> FunctionTool | None:
         """取核心内置工具实例，成功即缓存。
@@ -379,6 +424,11 @@ class KBSearchToolPlugin(Star):
                 # 调用方（旧核心/自定义 stub/契约冒烟）根本没有 provider 查询能力：
                 # 静默放行。多打一条 DEBUG 会破坏 test_01 的"成功注入恰好 1 条 DEBUG"。
                 return True
+            # 记下"判的是谁"，供注入成功那条 DEBUG 使用（写在这里 = 最后一次 await 之后，
+            # 到读取之间没有 await 点，不会串到别的会话）。provider 为 None 时不记：
+            # 那种情况下"判定对象"就是"没有"，让调用方写"未知（原因见上一条 DEBUG）"更诚实。
+            if provider is not None:
+                self._judged_provider = describe_provider(provider)
             if provider is None:
                 return self._assume_supported(
                     "provider=None", "取不到 provider（provider=None）"
@@ -458,8 +508,15 @@ class KBSearchToolPlugin(Star):
         return False, None
 
     def _assume_supported(self, key: str, reason: str) -> bool:
-        """fail-open：按"支持工具"处理，同一个原因只 DEBUG 一次（返回值恒为 True）。"""
+        """fail-open：按"支持工具"处理，同一个原因只 DEBUG 一次（返回值恒为 True）。
+
+        ``_unknown_logged`` 有上界（``_UNKNOWN_LOG_CAP``）：键里含异常消息摘要，上游只要给出
+        带可变内容的异常（端口、超时毫秒、umo、URL），每次请求都能造出一个新键。到顶就清空
+        重来 —— 这只影响"同一条 DEBUG 会不会再出现一次"，不会影响任何判定结果。
+        """
         if key not in self._unknown_logged:
+            if len(self._unknown_logged) >= _UNKNOWN_LOG_CAP:
+                self._unknown_logged.clear()
             self._unknown_logged.add(key)
             logger.debug(
                 "[KBTool] 无法判定当前 provider 是否支持工具调用（%s），按支持处理。",
