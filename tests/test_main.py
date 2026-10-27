@@ -12,6 +12,7 @@ README §4 与 ``main.py`` 里 ``_provider_tool_support`` 的 docstring；其中
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -1153,6 +1154,37 @@ def test_47_prefilter_failure_falls_back_instead_of_breaking_injection(
     assert req.func_tool.get_tool(plugin_module.KB_TOOL_NAME) is tool
     assert context.provider_calls == ["async:aiocqhttp:FriendMessage:10086"]
     assert messages(logs, logging.ERROR) == [], "预筛失败不该产生任何 ERROR"
+
+
+def test_47b_prefilter_treats_an_unreadable_session_preference_as_unproven(
+    plugin_module, logs
+):
+    """会话偏好读不出来 = "证明不了"，绝不等于"不注入"（R9 P2-2）。
+
+    修前 ``selected_provider_id()`` 在 ``try`` 外：``event.get_extra`` 抛异常会把整条
+    钩子带进 fail-closed（不注入 + 一条 ERROR），而关掉预筛反而正常。预筛只许让我们
+    多查一次 DB，不许改变注入决策。
+    """
+    plugin, _, context, tool = make_plugin(
+        plugin_module,
+        kb_names=["kb1"],
+        provider=_pure_ok(plugin_module),
+        provider_api=("async",),
+    )
+
+    class RaisingExtrasEvent(stub.AstrMessageEvent):
+        def get_extra(self, key: str | None = None, default=None):
+            raise RuntimeError("event extras exploded")
+
+    req = stub.ProviderRequest()
+    asyncio.run(plugin.on_llm_request(RaisingExtrasEvent(), req))
+
+    assert req.func_tool is not None, "读不到会话偏好时不许 fail-closed"
+    assert req.func_tool.get_tool(plugin_module.KB_TOOL_NAME) is tool
+    assert context.provider_calls == ["async:aiocqhttp:FriendMessage:10086"], (
+        "预筛证明不了时必须退回查一次 DB"
+    )
+    assert messages(logs, logging.ERROR) == []
 
 
 def test_48_prefilter_is_disabled_for_session_selected_provider(

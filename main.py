@@ -301,11 +301,17 @@ def prefilter_proves_support(loaded: object, config: object) -> bool:
     部署不再享受这项优化（实测本机真实配置里就有这样一条，但它同时还有一条启用的 offender，
     本来也不会命中）。
 
-    残留边界（诚实记录）：本判据假设"被加载的 chat 实例，其 ``id`` 来自配置里的某个条目"。
-    若第三方代码绕过 ``ProviderManager`` 直接往 ``inst_map`` 里塞一个配置里没有的实例，
-    第 4 条会因为 id 对不上而退回查 DB；但若**同时**把配置里的对应条目删掉、且把那条
-    "禁用+改能力声明"的编辑在同一次保存里做完，这份判据看不到那个实例 —— 本插件不改核心、
-    也不读 ``inst_map``（私有面），无法再进一步。
+    残留边界（诚实记录，2026-10-27 R9 实测更正）：本判据假设"被加载的 chat 实例，
+    其 ``id`` 都来自配置里的某个条目"。**唯一**能误放行的形态是：第三方代码绕过
+    ``ProviderManager`` 直接往 ``inst_map`` 里塞一个**配置里没有的实例**，并让会话偏好
+    指向它 —— 此时配置与加载表 id 集合恰好仍相等，预筛会"证明支持"并跳过点查
+    （真 ``ProviderManager`` + ``set_provider`` 已复现）。**反过来说**：把配置条目删掉
+    会让本判据退回查 DB（读到那个 rogue 实例的 ``modalities`` 后正常跳过注入），
+    所以"删配置条目"不是危险形态、反而更安全——早期文档把它写反了。
+    普通用户无法触发：WebUI 增/删/改/停用、``create/update/reload/delete`` 的 await
+    窗口、会话选模型、手改配置共 14 个场景实测全部安全；只有第三方写核心私有面才行。
+    后果分版本：4.29.x 的 runner 会在请求期清空不支持的工具（无害）；4.23.0–4.23.2
+    的清空发生在钩子之前，工具会真的发出去。本插件不改核心、也不读 ``inst_map``。
     """
     if not isinstance(loaded, (list, tuple)):
         return False  # 不是可数序列就没法比数量（生成器也在此止步）
@@ -675,7 +681,14 @@ class KBSearchToolPlugin(Star):
         在 ``only_when_kb_configured`` 打开时本来就已经付过（``_kb_available`` 读 ``kb_names``
         用的是同一个方法、同一个 umo），关掉时多一次内存查表。
         """
-        if selected_provider_id(event) is not None:
+        try:
+            selected = selected_provider_id(event)
+        except Exception:  # noqa: BLE001 - 读不到会话偏好只能"证明不了"，退回查 DB
+            # R9 实测：这行原来在 try 外，event.get_extra 抛异常时会把整条钩子带进
+            # fail-closed（不注入 + 一条 ERROR）；关掉预筛反而正常。预筛只许"证明
+            # 不了 → 多查一次"，不许改变注入决策。
+            return False
+        if selected is not None:
             return False
         getter = getattr(self.context, "get_all_providers", None)
         if not callable(getter):
@@ -781,7 +794,11 @@ class KBSearchToolPlugin(Star):
         - 两个方法都没有 → ``(False, None)``：调用方静默放行（见 ``_provider_tool_support``）。
         """
         umo = getattr(event, "unified_msg_origin", None)
-        selected = selected_provider_id(event)
+        try:
+            selected = selected_provider_id(event)
+        except Exception:  # noqa: BLE001 - 读不到会话偏好就当"没选"，继续走默认解析
+            # 与预筛那边同一条原则：读不到只是"不知道"，不许变成"不注入"（R9 P2-2）。
+            selected = None
         if selected is not None:
             get_by_id = getattr(self.context, "get_provider_by_id", None)
             selected_provider = get_by_id(selected) if callable(get_by_id) else None
