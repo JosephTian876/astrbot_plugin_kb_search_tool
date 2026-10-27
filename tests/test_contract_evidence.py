@@ -1,6 +1,6 @@
 """``tests/_contract_evidence.py`` 的单测：**假绿守卫本身**必须被常规 ``pytest -q`` 覆盖。
 
-为什么单独一个文件：``contract_smoke.py`` 缺 ``ASTRBOT_SRC`` 时会模块级 skip，把守卫逻辑
+为什么单独一个文件：``test_contract_smoke.py`` 缺 ``ASTRBOT_SRC`` 时会模块级 skip，把守卫逻辑
 写在它里面就等于让守卫永不被常规测试跑到 —— 而它正是用来防止"绿了但什么都没测到"的那道闸。
 这里的用例全部脱网、不导入 ``astrbot``，只喂字符串与路径。
 """
@@ -213,8 +213,10 @@ def test_assert_evidence_accepts_sync_fallback_shape(tmp_path):
 
 
 def test_contract_smoke_still_uses_the_guard():
-    """结构钉：``contract_smoke.py`` 真的调用了守卫（否则上面的单测只测了一个孤儿模块）。"""
-    source = (REPO_ROOT / "tests" / "contract_smoke.py").read_text(encoding="utf-8")
+    """结构钉：``test_contract_smoke.py`` 真的调用了守卫（否则上面的单测只测了一个孤儿模块）。"""
+    source = (REPO_ROOT / "tests" / "test_contract_smoke.py").read_text(
+        encoding="utf-8"
+    )
     assert "assert_evidence_matches" in source
     assert "extract_evidence" in source
     # 守卫必须在 `CONTRACT_OK` 断言**之后**仍然执行：不能只在失败分支里跑。
@@ -225,9 +227,11 @@ def test_contract_smoke_still_uses_the_guard():
 
 def test_contract_smoke_docstring_has_no_machine_specific_paths():
     """P1-1 的另一半：文件头不能再写死本机绝对路径（换成占位符）。"""
-    source = (REPO_ROOT / "tests" / "contract_smoke.py").read_text(encoding="utf-8")
+    source = (REPO_ROOT / "tests" / "test_contract_smoke.py").read_text(
+        encoding="utf-8"
+    )
     for marker in ("D:\\UwU", "dshworkdir", "D:\\AstrBot", "fix-venv"):
-        assert marker not in source, f"contract_smoke.py 里还有本机路径: {marker}"
+        assert marker not in source, f"test_contract_smoke.py 里还有本机路径: {marker}"
 
 
 def test_contract_evidence_module_is_importable_without_real_astrbot():

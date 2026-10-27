@@ -12,6 +12,7 @@ README（「X.Y.Z 起……」）与 CHANGELOG（节标题）。三处任何一�
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import re
 from pathlib import Path
@@ -116,12 +117,16 @@ def test_40_probe_and_contract_smoke_have_no_machine_specific_paths():
 
     为什么值得一条用例：这两份脚本是"结论的证据"。写死 ``D:\\UwU\\...`` 时它们在本机能跑、
     在别人机器上只会报"你的目录不存在"——证据就变成了不可复跑的断言（R5 §5.1 实测）。
-    ``contract_smoke.py`` 的假绿守卫另见 ``tests/test_contract_evidence.py``。
+    ``test_contract_smoke.py`` 的假绿守卫另见 ``tests/test_contract_evidence.py``。
     """
     markers = ("D:\\UwU", "dshworkdir", "D:\\AstrBot", "fix-venv", "C:\\Users")
     # README 也一起查：它的"契约冒烟"示例是用户照着抄的，写死别人的路径同样不可复跑
     # （而且那份示例里的 `$py` 曾经没有任何地方定义过）。
-    for name in ("tests/probe_core_config.py", "tests/contract_smoke.py", "README.md"):
+    for name in (
+        "tests/probe_core_config.py",
+        "tests/test_contract_smoke.py",
+        "README.md",
+    ):
         text = (REPO_ROOT / name).read_text(encoding="utf-8")
         for marker in markers:
             assert marker not in text, f"{name} 里还有本机路径: {marker}"
@@ -362,3 +367,47 @@ def test_63_promise_is_backed_by_a_runnable_test_not_by_the_offline_matrix():
     assert "_ProviderMustNotBeTouched" in source, (
         "开关关闭时要用 BaseException 陷阱证明'一次都没碰 provider'"
     )
+
+
+def test_64_contract_smoke_is_actually_collected_by_pytest():
+    """P2-a：契约冒烟必须**真的被 pytest 收集**（R7 §2.2：旧文件名从未被收集）。
+
+    R7 实测：``tests/contract_smoke.py`` 不匹配 pytest 默认的 ``python_files``，所以
+    ``pytest -q`` 收集 209 条、其中 ``contract_smoke.py::`` 是 **0** 条；设不设
+    ``ASTRBOT_SRC`` 都一样。于是"绿了就能发"的流程里这条门等于不存在。
+
+    这条结构钉防三种复发：
+    1. 文件名被改回去（不再匹配 ``test_*.py`` / ``*_test.py``）；
+    2. ``pyproject.toml`` 把 ``python_files`` 改窄、把它排除在外；
+    3. 缺 ``ASTRBOT_SRC`` 时的 skip 被删掉/改成静默 pass（那样 CI 里会假装通过）。
+    """
+    path = REPO_ROOT / "tests" / "test_contract_smoke.py"
+    assert path.exists(), "契约冒烟文件不见了"
+    assert not (REPO_ROOT / "tests" / "contract_smoke.py").exists(), (
+        "旧文件名（不会被 pytest 收集）不该再存在"
+    )
+    # 1. 文件名符合 pytest 默认规则（与 pytest 的实现一致：两个 glob 任一命中）。
+    assert any(
+        fnmatch.fnmatch(path.name, pattern) for pattern in ("test_*.py", "*_test.py")
+    ), f"{path.name} 不匹配 pytest 默认 python_files"
+
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    # 2. 若覆盖了 python_files，必须仍然包含 test_*.py。
+    if "python_files" in pyproject:
+        assert "test_*.py" in pyproject, (
+            "pyproject.toml 覆盖了 python_files，但没有包含 test_*.py"
+        )
+
+    source = path.read_text(encoding="utf-8")
+    # 3. 缺 ASTRBOT_SRC → 模块级 skip，理由要能看懂。
+    assert "allow_module_level=True" in source, "缺 ASTRBOT_SRC 时必须模块级 skip"
+    assert "未设置 ASTRBOT_SRC" in source, "skip 消息要说明缺的是哪个环境变量"
+    assert "pytest.skip(" in source
+    # 4. 设了 ASTRBOT_SRC 时真的跑：父测试必须真的启动子进程并核对 evidence。
+    assert "subprocess.run(" in source
+    assert "assert_evidence_matches(evidence, ASTRBOT_SRC)" in source
+
+    # 5. README 要给出"发布前手工跑一次"的命令（否则没人知道该跑它）。
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "python -m pytest tests/test_contract_smoke.py -q" in readme
+    assert "发布前手工跑一次" in readme

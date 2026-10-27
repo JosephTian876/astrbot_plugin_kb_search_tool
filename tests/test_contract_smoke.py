@@ -1,20 +1,29 @@
-"""契约冒烟：在**真实 AstrBot 源码**上验证插件对核心的每一条假设。
+r"""契约冒烟：在**真实 AstrBot 源码**上验证插件对核心的每一条假设。
 
-默认不跑，**两层原因**（都实测过）：文件名不符合 pytest 默认的 ``test_*.py`` / ``*_test.py``，
-所以普通 ``pytest -q`` **根本不会收集它**（实测：设不设 ``ASTRBOT_SRC`` 都只收集 209 个用例）；
-显式点名跑它时，缺 ``ASTRBOT_SRC`` 还会模块级 skip。要跑它需要一份 AstrBot 源码树
-（**任何** AstrBot 源码树都行，不需要是当前生产版本；``ASTRBOT_SRC`` 指到的是**包含**
-``astrbot/`` 包的那一层目录）：
+**它现在真的会被收集**：文件名是 ``test_*.py``（R7 §2.2 发现旧名 ``contract_smoke.py``
+不匹配 pytest 默认的 ``python_files``，所以 ``pytest -q`` 从未收集过它 —— "绿了就能发"的
+发布流程里，这条门等于不存在）。现在：
+
+- **没设 ``ASTRBOT_SRC``** → 模块级 skip，理由写在 skip 消息里，不影响其它用例；
+- **设了 ``ASTRBOT_SRC``** → 在子进程里**真的执行**（``python -B tests/test_contract_smoke.py``）。
+
+要跑它需要一份 AstrBot 源码树（**任何** AstrBot 源码树都行，不需要是当前生产版本；
+``ASTRBOT_SRC`` 指到的是**包含** ``astrbot/`` 包的那一层目录），并且**跑它的解释器要有那份
+源码树的依赖**（``openai``/``httpx`` 等）—— 插件自己的开发 venv 只装 pytest/ruff 时请改用
+AstrBot 自己的解释器：
 
 ```powershell
 # 4.29.1（生产源码，只读）
 $env:ASTRBOT_SRC = '<AstrBot 源码树>'          # 例如 …/backend/app
-& python -m pytest tests/contract_smoke.py -q
+& python -m pytest tests/test_contract_smoke.py -q
 
 # 4.23.0（声明下界；git archive v4.23.0 astrbot | tar -x 导出的树）
 $env:ASTRBOT_SRC = '<导出目录>'
-& python -m pytest tests/contract_smoke.py -q
+& python -m pytest tests/test_contract_smoke.py -q
+Remove-Item Env:\ASTRBOT_SRC   # 日常 pytest -q 不要留这个变量
 ```
+
+**发布前手工跑一次**（发布检查清单）：见 README「开发 → 契约冒烟」。
 
 **这个"绿"必须是有意义的**：父测试会把子进程输出里的 evidence JSON 抠出来，断言
 ``astrbot.__file__`` 反查出的包路径**确实位于 ``ASTRBOT_SRC`` 之下**（并把
@@ -60,7 +69,8 @@ ASTRBOT_SRC = os.environ.get("ASTRBOT_SRC", "").strip()
 
 if not ASTRBOT_SRC and __name__ != "__main__":
     pytest.skip(
-        "未设置 ASTRBOT_SRC：跳过真实核心契约冒烟（用法见 tests/contract_smoke.py 顶部）",
+        "未设置 ASTRBOT_SRC：跳过真实核心契约冒烟"
+        "（设了才跑；用法与'发布前手工跑一次'见 tests/test_contract_smoke.py 顶部）",
         allow_module_level=True,
     )
 

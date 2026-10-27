@@ -1,7 +1,7 @@
 """契约冒烟的 evidence 解析与核对（纯函数，可单独单测）。
 
 为什么要单独一个模块：这两件事都必须**在没有真实 AstrBot 源码树的机器上**也能被测到。
-``contract_smoke.py`` 在缺 ``ASTRBOT_SRC`` 时会模块级 skip，把断言逻辑放在它里面就等于
+``test_contract_smoke.py`` 在缺 ``ASTRBOT_SRC`` 时会模块级 skip，把断言逻辑放在它里面就等于
 让"守卫本身"永不被常规 ``pytest -q`` 覆盖 —— 而它正是用来防止"假绿"的那道闸。
 
 背景（实测）：子进程做的是 ``sys.path.insert(0, ASTRBOT_SRC)`` 后 ``import astrbot``。

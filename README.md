@@ -299,24 +299,39 @@ python -m ruff format --check .
 里面**没有** `astrbot.core`：插件一旦退化回私有导入，测试会立刻失败。
 校验 `metadata.yaml` 需要 `PyYAML`（AstrBot 核心自身也依赖它）。
 
-### 契约冒烟（可选，需要真实 AstrBot 源码）
+### 契约冒烟（需要真实 AstrBot 源码；**发布前手工跑一次**）
 
-`tests/contract_smoke.py` 在**真实核心**上验证：公开面导入、`star_map` 注册（删掉
+`tests/test_contract_smoke.py` 在**真实核心**上验证：公开面导入、`star_map` 注册（删掉
 `@register` 后仍被识别）、钩子 `priority`、真实 `ProviderRequest` 注入与实例同一性、
 导入期无 `DeprecationWarning`，以及**版本差异**：真实 `Context` 到底有哪些 provider 查询
 方法（4.23–4.26 没有 `get_using_provider_async`），并按那个形状跑一次「`modalities=["text"]`
-→ 跳过 / `modalities=None` → 放行」。它**默认跳过**（缺 `ASTRBOT_SRC`），不影响上面的
-`pytest -q`；设置环境变量后单独跑：
+→ 跳过 / `modalities=None` → 放行」。
+
+**它现在会被 `pytest -q` 收集**（文件名是 `test_*.py`）：没设 `ASTRBOT_SRC` 时模块级
+**skip**（不影响其它用例），设了才会真的在子进程里跑。所以**发布前手工跑一次**：
 
 ```powershell
-# ASTRBOT_SRC 要指到**包含 astrbot/ 包的那一层目录**（不是 …/astrbot 里面）
-$env:ASTRBOT_SRC = '<AstrBot 源码树>'          # 例如 <AstrBot 仓库>/backend/app
-python -m pytest tests/contract_smoke.py -q
+# 0) 日常门禁不要设 ASTRBOT_SRC（否则 pytest -q 会去加载真实核心）
+Remove-Item Env:\ASTRBOT_SRC -ErrorAction SilentlyContinue
+python -m pytest -q                              # 应看到 "... 1 skipped"
+python -m ruff check .
+python -m ruff format --check .
 
-$env:ASTRBOT_SRC = '<导出目录>'                # 4.23.0（声明下界）
-python -m pytest tests/contract_smoke.py -q
-# 导出下界源码树：git archive v4.23.0 astrbot | tar -x -C <导出目录>
+# 1) 发布前：在真实源码树上跑一次契约冒烟（4.29.1 = 当前生产版本）
+#    ASTRBOT_SRC 要指到**包含 astrbot/ 包的那一层目录**（不是 …/astrbot 里面）
+$env:ASTRBOT_SRC = '<AstrBot 源码树>'          # 例如 <AstrBot 仓库>/backend/app
+python -m pytest tests/test_contract_smoke.py -q   # 应为 1 passed
+Remove-Item Env:\ASTRBOT_SRC
+
+# 2) 再在声明下界 4.23.0 上跑一次（导出下界源码树）
+git archive v4.23.0 astrbot | tar -x -C <导出目录>
+$env:ASTRBOT_SRC = '<导出目录>'
+python -m pytest tests/test_contract_smoke.py -q   # 应为 1 passed
+Remove-Item Env:\ASTRBOT_SRC
 ```
+
+> 跑它的解释器要有**那份源码树的依赖**（`openai`/`httpx` 等）。本插件自己的开发 venv
+> 只装 `pytest`/`ruff`/`PyYAML`；请用 AstrBot 自己的 venv 解释器跑第 1、2 步。
 
 **它不会给你假绿**：父测试会把子进程输出里的 evidence JSON 抠出来，断言
 `astrbot.__file__` 反查到的包路径**严格位于** `ASTRBOT_SRC` 之下（并核对

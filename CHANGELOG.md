@@ -164,9 +164,10 @@ harness 在仓库外、谁也无法复跑，而它恰好唯一挡住了上面那
     - 有 1 个 provider 声明 `["text","image"]` 时（预筛必须退回）：
       2.3361 / 2.2510 ms vs 基线 2.1638 / 2.2945 ms，配对差 −0.16 / +0.01 ms ——
       预筛扫描本身约 0.4 µs，落在噪声里，**没有回归**。
-    - R8 复测（同一台机器，真 4.29.1，2000 次采样）：预筛入口 **median 0.0029 ms /
-      p95 0.0031 ms**（多读一次 `get_config(umo)` 后从 0.0004 → 0.0029 ms），
-      被替换掉的那次点查 **median 1.2098 ms / p95 1.7109 ms**。
+    - R8 复测（同一台机器，真 4.29.1，4 次独立运行、每次 2000 次采样）：预筛入口
+      **median 0.0027–0.0029 ms / p95 0.0029–0.0031 ms**（因为要多读一次 `get_config(umo)`，
+      从 0.0004–0.0006 ms 升上来的），被替换掉的那次点查 **median 0.98–1.39 ms**
+      （同一批运行）。即预筛成本仍只有被省掉那次点查的 **1/350 左右**。
   - 保守性（可验证的边界，不是"绝不"）：预筛只可能"退回查 DB"，**不会改变"判定为不支持"的
     语义**。会话级 `selected_provider` 存在时直接不做预筛（它可能解析到
     `get_all_providers()` 里没有的非 chat provider）；`get_all_providers` 缺失、抛异常、
@@ -212,6 +213,12 @@ harness 在仓库外、谁也无法复跑，而它恰好唯一挡住了上面那
 - 单测 **56 → 144**（+88，R4 收口）：布尔白名单 3 键 × 15 种写法、认不出的值 3 键 × 10 种、
   字符串 `"false"` 真关闸门（provider 一次都不查）、未知键告警、`None` 工具告警与自愈、
   异常去重（同类型两种原因 / 同类型超过 80 字）、版本号 0.3.0 与文档一致性、schema 键 1:1。
+- 单测 **209 → 242**（+33，R8）：terminate 窗口三形态 × 预筛可用/不可用（6 例）、预筛纯函数
+  「配置 id 集合 == 加载表 id 集合」真值表（18 例）、`str`/`bytes` 输入、日志条数上界
+  （70 与 200 个不同原因）、DEBUG/ERROR 两个预算互不挤占、`session_get`/`get_tool`/`add_tool`
+  抛异常各"3 次请求 → 1 条"、契约冒烟可被收集。
+  （`pytest -q` 现在是 **242 passed + 1 skipped**：那 1 个 skip 就是没设 `ASTRBOT_SRC` 的
+  契约冒烟模块，它终于被收集了。）
 - 单测 **145 → 209**（+64，R5/C2；本轮起点实测 145，上一行 R4 的 144 是历史数字，未改）：契约冒烟的假绿守卫（23 例，含"回落到另一棵树"的
   复刻）、审计文档不在仓库且零悬空引用、探针无本机绝对路径、静态预筛（跳过/退回/不得
   放行/无该方法/抛异常/selected_provider/开关关闭/纯函数真值表/拒绝 Mapping）、hint 长度
@@ -225,7 +232,14 @@ harness 在仓库外、谁也无法复跑，而它恰好唯一挡住了上面那
   evidence JSON，用 `astrbot.__file__` 反查包路径，要求它**严格位于** `ASTRBOT_SRC` 之下，
   并顺带核对 `provider_api` / `provider_gate`。判定逻辑在 `tests/_contract_evidence.py`，
   由 `tests/test_contract_evidence.py` 在常规 `pytest -q` 里覆盖（放进会模块级 skip 的
-  `contract_smoke.py` 就等于永不执行）。
+  `test_contract_smoke.py` 就等于永不执行）。
+- **契约冒烟以前从未被 `pytest -q` 收集**：旧文件名 `contract_smoke.py` 不匹配 pytest 默认的
+  `python_files`（实测收集 209 条、其中 `contract_smoke.py::` 是 **0** 条，设不设
+  `ASTRBOT_SRC` 都一样）。现已改名为 `tests/test_contract_smoke.py`：缺 `ASTRBOT_SRC` 时
+  模块级 skip（理由写在 skip 消息里），设了就在子进程里真的跑。README「开发」给出**发布前
+  手工跑一次**的命令（4.29.1 与 4.23.0 各一次），并由 `test_64` 钉住"文件名可被收集 +
+  skip 存在 + 父测试真的核对 evidence + README 有那条命令"。日常 `pytest -q` 不要设置
+  `ASTRBOT_SRC`（否则它会去加载真实核心，需要那份源码树的依赖）。
 - 全新跑过的三棵树：4.23.0（`via: sync`）、4.28.1、4.29.1（`via: async`）各 `1 passed`；
   空目录与"多一层（`…/app/astrbot`）"各 `1 failed` —— 绿与红都重新有意义了。
 - 独立复验（R3，自建 harness，**不入库、不作为承诺的一部分**）：1260 场景 × 两实现，
@@ -283,7 +297,7 @@ harness 在仓库外、谁也无法复跑，而它恰好唯一挡住了上面那
 需要 **AstrBot >= 4.23**（`FunctionToolManager.get_builtin_tool()` 自该版本起提供）。
 本轮已在 4.23.0 与 4.29.1 的真实源码上验证：公开面导入、钩子注册（`priority=-310000`）、
 真实 `ProviderRequest` 注入、会话级知识库判定均通过。仓库里可用
-`tests/contract_smoke.py` 复跑（设置 `ASTRBOT_SRC` 指向源码树，见 README「开发」）。
+`tests/test_contract_smoke.py` 复跑（设置 `ASTRBOT_SRC` 指向源码树，见 README「开发」）。
 
 ### 二轮审查收口
 
@@ -308,8 +322,10 @@ harness 在仓库外、谁也无法复跑，而它恰好唯一挡住了上面那
   `pyproject.toml`（ruff `select = E,F,W,I,BLE,RUF` + pytest `testpaths`），从此
   `# noqa: BLE001` 这类注释真的生效。
 - **测试**：新增 `tests/contract_smoke.py`（真实核心契约冒烟，缺 `ASTRBOT_SRC` 时自动
-  跳过）；替身 `ToolSet.add_tool` 与核心的"优先 active"语义逐条对齐；补三条断言
-  （钩子关键字名、非 dict 会话配置、`astrbot_version` 可被 `SpecifierSet` 解析）。
+  跳过；**0.3.0 起改名为 `tests/test_contract_smoke.py`** —— 旧名不匹配 pytest 默认的
+  `python_files`，从未被 `pytest -q` 收集）；替身 `ToolSet.add_tool` 与核心的"优先 active"
+  语义逐条对齐；补三条断言（钩子关键字名、非 dict 会话配置、`astrbot_version` 可被
+  `SpecifierSet` 解析）。
 
 ## 0.1.3 - 2026-10-26
 
