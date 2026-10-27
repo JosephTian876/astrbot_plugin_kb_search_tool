@@ -104,6 +104,8 @@ class FakeContext:
         provider_api=(),
         providers_by_id: dict | None = None,
         provider_error: BaseException | None = None,
+        all_providers: list | None = None,
+        all_providers_error: BaseException | None = None,
     ) -> None:
         self._manager = manager
         self.kb_names = list(kb_names or [])
@@ -116,7 +118,21 @@ class FakeContext:
         self.provider_error = provider_error
         #: 每次 provider 查询记一条 ``"<方法>:<参数>"``；"该查/不该查"全靠它断言。
         self.provider_calls: list[str] = []
+        #: ``get_all_providers()`` 的返回（O1 静态预筛用）。``None`` = **不提供该方法**，
+        #: 与"提供了但返回空列表"是两种输入，测试要能分别构造。
+        self.all_providers = all_providers
+        self.all_providers_error = all_providers_error
+        #: 预筛被调用的次数（预筛自身也要"不查 DB"）。
+        self.all_providers_calls = 0
         self._install_provider_api(provider_api)
+        if all_providers is not None or all_providers_error is not None:
+            self.get_all_providers = self._get_all_providers
+
+    def _get_all_providers(self):
+        self.all_providers_calls += 1
+        if self.all_providers_error is not None:
+            raise self.all_providers_error
+        return list(self.all_providers or [])
 
     def get_llm_tool_manager(self):
         return self._manager
@@ -175,6 +191,8 @@ def make_plugin(
     provider_api=(),
     providers_by_id: dict | None = None,
     provider_error: BaseException | None = None,
+    all_providers: list | None = None,
+    all_providers_error: BaseException | None = None,
 ):
     """构造被测插件，返回 ``(plugin, manager, context, tool)``。"""
     tool = stub.FunctionTool(plugin_module.KB_TOOL_NAME)
@@ -187,6 +205,8 @@ def make_plugin(
         provider_api=provider_api,
         providers_by_id=providers_by_id,
         provider_error=provider_error,
+        all_providers=all_providers,
+        all_providers_error=all_providers_error,
     )
     plugin = plugin_module.KBSearchToolPlugin(context, config)
     return plugin, manager, context, tool
@@ -851,6 +871,288 @@ def test_26_no_kb_returns_before_the_provider_probe(plugin_module, hook, logs):
     assert len(warnings) == 1, "只出既有的 no-KB 告警（一次），不叠加 provider 告警"
     assert "only_when_kb_configured" in warnings[0]
     assert messages(logs, logging.ERROR) == []
+
+
+# ---------------------------------------------------------------------------
+# O1 静态预筛（P2-1）：没有任何 provider 声明"缺 tool_use"时，整段跳过 DB 点查
+#
+# 预筛的输入是公开面 ``context.get_all_providers()``（= 核心的 chat ``provider_insts``）。
+# 它只被允许做一件事：**证明本次必然判为支持**，然后省掉那次查询。证明不了就必须照旧查。
+# 所以这里的用例分成两组：能省的（查询 0 次、注入正常）与证明不了的（照旧查，语义不变）。
+# ---------------------------------------------------------------------------
+
+
+def _pure_ok(plugin_module, **kwargs) -> FakeProvider:
+    """一个"未配置 modalities"的 provider：插件判它支持。"""
+    config = {"id": "p0", "model": "m0"}
+    config.update(kwargs)
+    return FakeProvider(config)
+
+
+def test_43_prefilter_skips_the_provider_query_when_nobody_declares_unsupported(
+    plugin_module, hook, logs
+):
+    """三件都"未配置能力" → 预筛当场证明支持：provider 一次都不查，注入照旧。"""
+    plugin, _, context, tool = make_plugin(
+        plugin_module,
+        kb_names=["kb1"],
+        provider=_pure_ok(plugin_module),
+        provider_api=("async", "sync", "by_id"),
+        all_providers=[_pure_ok(plugin_module) for _ in range(3)],
+    )
+
+    for _ in range(3):  # 每请求都重新扫（provider 可能在重载后才变）
+        req = stub.ProviderRequest()
+        hook(plugin, req)
+        assert req.func_tool is not None
+        assert req.func_tool.get_tool(plugin_module.KB_TOOL_NAME) is tool
+
+    assert context.provider_calls == [], (
+        "预筛成立时不该有任何 provider 查询（含 DB 点查）"
+    )
+    assert context.all_providers_calls == 3, "预筛本身每请求扫一次（纯内存，微秒级）"
+    assert messages(logs, logging.WARNING) == []
+    assert messages(logs, logging.ERROR) == []
+    assert len(messages(logs, logging.DEBUG)) == 3, "每请求一条注入 DEBUG，不额外加日志"
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        ["text"],  # 最常见的"只填了 text"
+        ["text", "image"],
+        ["audio"],
+    ],
+)
+def test_44_prefilter_falls_back_when_any_provider_declares_missing_tool_use(
+    plugin_module, hook, logs, declaration
+):
+    """只要有一个 provider 声明"非空且缺 tool_use"，预筛就必须放弃 → 照旧查 DB。
+
+    否则就是**误放行**：本次请求若恰好解析到那个 provider，本该跳过注入。
+    """
+    plugin, _, context, _ = make_plugin(
+        plugin_module,
+        kb_names=["kb1"],
+        provider=FakeProvider(
+            {"id": "p-current", "model": "m", "modalities": ["text", "tool_use"]}
+        ),
+        provider_api=("async",),
+        all_providers=[
+            _pure_ok(plugin_module),
+            FakeProvider({"id": "p-bad", "model": "m", "modalities": declaration}),
+        ],
+    )
+
+    req = stub.ProviderRequest()
+    hook(plugin, req)
+
+    assert context.provider_calls == ["async:aiocqhttp:FriendMessage:10086"], (
+        "预筛证明不了时必须回到原路径"
+    )
+    assert req.func_tool is not None, "当前 provider 支持工具 → 照常注入"
+
+
+def test_45_prefilter_proof_cannot_rescue_an_unsupported_current_provider(
+    plugin_module, hook, logs
+):
+    """反向钉子：当前 provider 明确不支持时，预筛也**不得**放行。
+
+    当"全体都不声明不支持"这个前提不成立（这里当前 provider 自己就是反例），预筛必然
+    退回查 DB，于是 WARNING 照旧出现、注入照旧被拦下。
+    """
+    plugin, _, context, _ = make_plugin(
+        plugin_module,
+        kb_names=["kb1"],
+        provider=FakeProvider(
+            {"id": "p-current", "model": "m", "modalities": ["text"]}
+        ),
+        provider_api=("async",),
+        all_providers=[
+            FakeProvider({"id": "p-current", "model": "m", "modalities": ["text"]})
+        ],
+    )
+
+    req = stub.ProviderRequest()
+    hook(plugin, req)
+
+    assert req.func_tool is None, "预筛不能把'不支持'放行"
+    assert context.provider_calls == ["async:aiocqhttp:FriendMessage:10086"]
+    warnings = messages(logs, logging.WARNING)
+    assert len(warnings) == 1 and "tool_use" in warnings[0]
+    assert messages(logs, logging.ERROR) == []
+
+
+def test_46_prefilter_is_skipped_when_the_context_has_no_get_all_providers(
+    plugin_module, hook, logs
+):
+    """``Context`` 没有 ``get_all_providers``（旧核心/替身）→ 静默跳过预筛，行为不变。"""
+    plugin, _, context, tool = make_plugin(
+        plugin_module,
+        kb_names=["kb1"],
+        provider=_pure_ok(plugin_module),
+        provider_api=("async",),
+    )
+    assert not hasattr(context, "get_all_providers"), "本用例要的就是「没有这个方法」"
+
+    req = stub.ProviderRequest()
+    hook(plugin, req)
+
+    assert req.func_tool is not None
+    assert req.func_tool.get_tool(plugin_module.KB_TOOL_NAME) is tool
+    assert context.provider_calls == ["async:aiocqhttp:FriendMessage:10086"], (
+        "没有预筛能力时照旧查一次"
+    )
+    assert messages(logs, logging.ERROR) == []
+
+
+def test_47_prefilter_failure_falls_back_instead_of_breaking_injection(
+    plugin_module, hook, logs
+):
+    """``get_all_providers()`` 抛异常 → 退回查 DB，绝不冒泡、绝不静默不注入。"""
+    plugin, _, context, tool = make_plugin(
+        plugin_module,
+        kb_names=["kb1"],
+        provider=_pure_ok(plugin_module),
+        provider_api=("async",),
+        all_providers_error=RuntimeError("provider registry exploded"),
+    )
+
+    req = stub.ProviderRequest()
+    hook(plugin, req)
+
+    assert req.func_tool is not None
+    assert req.func_tool.get_tool(plugin_module.KB_TOOL_NAME) is tool
+    assert context.provider_calls == ["async:aiocqhttp:FriendMessage:10086"]
+    assert messages(logs, logging.ERROR) == [], "预筛失败不该产生任何 ERROR"
+
+
+def test_48_prefilter_is_disabled_for_session_selected_provider(
+    plugin_module, hook, logs
+):
+    """会话级 ``selected_provider`` 存在时不做预筛：它可能指向不在 ``get_all_providers()``
+    里的对象（``get_provider_by_id`` 能返回 TTS/Embedding 实例），扫不到就证明不了。
+
+    这里当前 provider 明明支持工具（``["text", "tool_use"]``），预筛若被错误启用也会注入，
+    所以断言点放在"**查询发生了**"上 —— 它才是"预筛没被用"的直接证据。
+    """
+    plugin, _, context, tool = make_plugin(
+        plugin_module,
+        kb_names=["kb1"],
+        provider=_pure_ok(plugin_module),
+        provider_api=("async", "by_id"),
+        providers_by_id={
+            "p-sel": FakeProvider(
+                {"id": "p-sel", "model": "m", "modalities": ["text", "tool_use"]}
+            )
+        },
+        all_providers=[_pure_ok(plugin_module)],
+    )
+
+    req = stub.ProviderRequest()
+    hook(plugin, req, umo="umo-1", extras={"selected_provider": "p-sel"})
+
+    assert context.provider_calls == ["by_id:p-sel"], (
+        "有 selected_provider 时必须照旧判定"
+    )
+    assert req.func_tool is not None
+    assert req.func_tool.get_tool(plugin_module.KB_TOOL_NAME) is tool
+
+
+def test_49_prefilter_is_not_consulted_when_the_switch_is_off(plugin_module, hook):
+    """开关关闭时连预筛都不许碰 provider 面（0.2.0 等价性的延伸）。"""
+    plugin, _, context, tool = make_plugin(
+        plugin_module,
+        kb_names=["kb1"],
+        config={"respect_provider_tool_support": False},
+        provider_api=("async",),
+        all_providers=[_pure_ok(plugin_module)],
+    )
+
+    req = stub.ProviderRequest()
+    hook(plugin, req)
+
+    assert req.func_tool is not None
+    assert req.func_tool.get_tool(plugin_module.KB_TOOL_NAME) is tool
+    assert context.all_providers_calls == 0, "开关关闭时不该调 get_all_providers"
+    assert context.provider_calls == []
+
+
+@pytest.mark.parametrize(
+    ("configs", "expected"),
+    [
+        # 全体未声明 → 能证明支持（可跳过查询）
+        ([], True),
+        ([{"id": "a"}, {"id": "b", "modalities": None}], True),
+        ([{"id": "a", "modalities": []}], True),
+        ([{"id": "a", "modalities": ["tool_use"]}], True),
+        ([{"id": "a", "modalities": ["text", "tool_use"]}], True),
+        # 非 list / 缺键 / 非 dict 配置：都是"未知 → 按支持"，不是否定信号
+        ([{"id": "a", "modalities": "text"}], True),
+        ([{"id": "a", "modalities": ("tool_use",)}], True),
+        ([{"id": "a", "modalities": {"x": 1}}], True),
+        (["PROVIDER_WITHOUT_CONFIG"], True),
+        # 只要有一个"非空且缺 tool_use" → 证明不了
+        ([{"id": "a", "modalities": ["text"]}], False),
+        (
+            [
+                {"id": "a", "modalities": ["tool_use"]},
+                {"id": "b", "modalities": ["text"]},
+            ],
+            False,
+        ),
+    ],
+)
+def test_50_prefilter_pure_function_truth_table(plugin_module, configs, expected):
+    """纯函数真值表：``all_providers_declare_tool_support`` 只回答"能不能省这次查询"。
+
+    ``False`` 的唯一含义是"证明不了，去查吧" —— 不是"不支持"。所以这份表里所有
+    ``False`` 都对应"照旧查询"，没有任何一条会让插件误跳过注入。
+    """
+    providers = [
+        object() if item == "PROVIDER_WITHOUT_CONFIG" else FakeProvider(item)
+        for item in configs
+    ]
+    assert plugin_module.all_providers_declare_tool_support(providers) is expected
+
+
+@pytest.mark.parametrize("bad", [None, 42])
+def test_50b_prefilter_pure_function_rejects_non_iterable(plugin_module, bad):
+    """``None`` / 非可迭代对象 → ``False``（证明不了）。"""
+    assert plugin_module.all_providers_declare_tool_support(bad) is False
+
+
+def test_50c_prefilter_pure_function_rejects_mappings(plugin_module):
+    """Mapping（例如误传 ``inst_map``）→ ``False``。
+
+    对 dict 迭代拿到的是**键**，``getattr(key, "provider_config")`` 是 ``None``，于是会
+    静默得出"全体未声明"—— 那就是误放行。这条钉住"宁可多查一次"。
+    """
+    # 值里放一个明确不支持的 provider：若实现漏了这个判断，就会错误地返回 True。
+    mapping = {
+        "p-bad": FakeProvider({"id": "p-bad", "modalities": ["text"]}),
+        "p-ok": FakeProvider({"id": "p-ok"}),
+    }
+    assert plugin_module.all_providers_declare_tool_support(mapping) is False
+
+
+def test_51_prefilter_pure_function_survives_a_raising_iterable(plugin_module):
+    """provider 列表迭代中途抛异常 → 返回 ``False``（退回查询），绝不冒泡。"""
+
+    def boom():
+        yield FakeProvider({"id": "a"})
+        raise RuntimeError("registry died mid-iteration")
+
+    assert plugin_module.all_providers_declare_tool_support(boom()) is False
+
+
+def test_52_prefilter_reads_the_same_selected_provider_logic_as_the_gate(plugin_module):
+    """结构钉：``selected_provider`` 的解析只有一份实现（两处各写一份必然分叉）。"""
+    source = (REPO_ROOT / "main.py").read_text(encoding="utf-8")
+    assert source.count('get_extra("selected_provider")') == 1, (
+        "`selected_provider` 只应在 selected_provider_id() 里解析一次"
+    )
+    assert "selected_provider_id(" in source
 
 
 def test_27_non_standard_func_tool_keeps_0_2_0_behavior(plugin_module, hook, logs):

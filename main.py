@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from astrbot.api import FunctionTool, ToolSet, logger, sp
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
@@ -69,6 +71,71 @@ def parse_bool_setting(value: object) -> bool | None:
         if token in _FALSE_TOKENS:
             return False
     return None
+
+
+def all_providers_declare_tool_support(providers: object) -> bool:
+    """静态预筛（O1）：可枚举的 chat provider 里，**没有任何一个**声明"不支持工具"。
+
+    "声明不支持"用的判据与 ``_provider_tool_support`` 逐字相同：``modalities`` 是**非空
+    list 且不含 ``tool_use``**。只要一个这样的 provider 存在，本函数就返回 ``False``。
+
+    返回 ``False`` 的含义只有一个：**无法证明**"本次请求必然判为支持"，调用方必须回到
+    原来的路径（查一次 provider）。它绝不表示"不支持"：这里只是"别省这一步"的信号。
+    因此它的错误方向只可能是"多查一次 DB"（安全），不可能是"误放行"（危险）。
+
+    安全论证（为什么"扫全量 chat provider 都没声明不支持"就能跳过查询）：
+
+    - 核心解析 provider 只有三条出口：会话级 ``selected_provider`` → ``inst_map.get(id)``、
+      会话偏好 → ``inst_map.get(id)``、都没有 → ``provider_insts[0]``
+      （4.29.1 ``core/provider/manager.py:245-258``）。
+    - 每个成功加载的 provider 同时进 ``inst_map``（``:812``）与（chat 类型）
+      ``provider_insts``（``:778``），禁用的根本不加载（``:670-672``）。而公开面
+      ``Context.get_all_providers()`` 返回的就是 ``provider_insts``（``core/star/context.py``；
+      4.23.0 同款），所以它是 chat provider 的**超集**。
+    - 例外是"会话级 ``selected_provider`` 指向非 chat provider"（``get_provider_by_id``
+      能取到 TTS/Embedding 实例）：那种对象不在 ``get_all_providers()`` 里，无法扫到。
+      调用方因此只在**没有** ``selected_provider`` 时才用本预筛（见
+      ``_static_prefilter_proves_support``），把这条边角彻底排除。
+
+    保守性细节（都不影响正确性，只是别把预筛做激进）：
+
+    - ``providers`` 为 ``None`` / 不可迭代 / 迭代中途抛异常 → ``False``（退回查 DB）；
+    - ``providers`` 是 Mapping（例如有人把 ``inst_map`` 传进来）→ ``False``：对 dict 迭代
+      拿到的是**键**，``getattr(key, "provider_config")`` 自然是 None，于是静默得出"全体
+      未声明"——那就成了误放行。宁可多查一次。
+    - ``provider_config`` 不是 dict、``modalities`` 缺键/``None``/``[]``/非 list → 跳过该
+      provider：在原判定路径里这些也都是"未知 → 按支持处理"，不是否定信号，跳过后语义一致。
+    """
+    if providers is None or isinstance(providers, Mapping):
+        return False
+    try:
+        iterator = iter(providers)  # type: ignore[arg-type] - 运行时探测，非静态可判
+    except TypeError:
+        return False
+    try:
+        for provider in iterator:
+            config = getattr(provider, "provider_config", None)
+            if not isinstance(config, dict):
+                continue  # 读不到配置 = 未知；原路径同样按"支持"处理
+            modalities = config.get("modalities", _MODALITIES_MISSING)
+            if not isinstance(modalities, list) or not modalities:
+                continue  # 缺键 / None / 空 list / 非 list：都不是否定信号
+            if TOOL_USE_MODALITY not in modalities:
+                return False  # 有一个"明确不支持" → 无法证明全体支持，退回查 DB
+    except Exception:  # noqa: BLE001 - 预筛失败只能退回原路径，绝不能碰瓷主流程
+        return False
+    return True
+
+
+def selected_provider_id(event: object) -> str | None:
+    """会话级选中的 provider id（WebUI/开放 API 选模型时才有），没有则 ``None``。
+
+    提取成独立函数是为了让"预筛能不能用"与"实际判定用哪个 provider"读**同一份**逻辑：
+    两处若各写一份 ``get_extra`` 判断，迟早会在某个边界（空串、非 str）上分叉。
+    """
+    get_extra = getattr(event, "get_extra", None)
+    selected = get_extra("selected_provider") if callable(get_extra) else None
+    return selected if isinstance(selected, str) and selected else None
 
 
 class KBSearchToolPlugin(Star):
@@ -187,10 +254,14 @@ class KBSearchToolPlugin(Star):
             return
 
         # 放在最后一步之前：只有"确实要注入"的请求才付这次判定成本（知识库判定更常见）。
-        if self.respect_provider_tool_support and not await self._provider_tool_support(
-            event, req
-        ):
-            return
+        if self.respect_provider_tool_support:
+            # O1 静态预筛：已加载的 chat provider 里没人声明"缺 tool_use"时，无论核心这次
+            # 解析到哪一个，判定结果都只能是"支持" —— 那次 DB 点查（实测约 1.36 ms）可以
+            # 整段跳过。预筛证明不了就照旧查一次，绝不改变"判定为不支持"的语义。
+            if not self._static_prefilter_proves_support(event) and (
+                not await self._provider_tool_support(event, req)
+            ):
+                return
 
         if tool_set is None:  # 纯对话没有别的工具时核心给的就是 None，不新建等于缺席
             req.func_tool = ToolSet()
@@ -257,6 +328,34 @@ class KBSearchToolPlugin(Star):
             # 用 debug 而非 warning：持续失败会每请求一条；排障时把插件日志调到 DEBUG 即可。
             logger.debug("[KBTool] 判定知识库可用性失败，按可用处理: %s", exc)
             return True
+
+    def _static_prefilter_proves_support(self, event: AstrMessageEvent) -> bool:
+        """O1 静态预筛：能否**不查 provider** 就断言"本次必然判为支持"。
+
+        ``True`` = 已加载的 chat provider 里没有任何一个声明"缺 ``tool_use``"，于是无论核心
+        这次解析到哪一个，``_provider_tool_support`` 都只会返回 ``True`` —— 那次 DB 点查
+        （实测 median 约 1.36 ms/请求）可以整段跳过。
+
+        ``False`` = **证明不了**，调用方照旧查一次。这条路径没有任何"判为不支持"的能力：
+        最坏结果只是多查一次 DB，所以它不可能放宽 ``respect_provider_tool_support``。
+
+        为什么有 ``selected_provider`` 时直接放弃预筛：会话级选中走
+        ``context.get_provider_by_id()``，它能返回 ``inst_map`` 里的**非 chat** provider
+        （TTS/Embedding），那类实例不在 ``get_all_providers()`` 的返回里，扫不到也就证明
+        不了。这类请求（WebUI/开放 API 显式选模型）本来就少，退回查一次 DB 是安全的。
+
+        为什么要 ``getattr`` 探测：``get_all_providers`` 不是本插件声明下界（4.23.0）之外
+        必须存在的私有面 —— 自定义 Context 替身/第三方加载器可能没有它，缺了就跳过预筛。
+        """
+        if selected_provider_id(event) is not None:
+            return False
+        getter = getattr(self.context, "get_all_providers", None)
+        if not callable(getter):
+            return False
+        try:
+            return all_providers_declare_tool_support(getter())
+        except Exception:  # noqa: BLE001 - 预筛失败只能退回查 DB
+            return False
 
     async def _provider_tool_support(
         self, event: AstrMessageEvent, req: ProviderRequest
@@ -342,9 +441,8 @@ class KBSearchToolPlugin(Star):
         - 两个方法都没有 → ``(False, None)``：调用方静默放行（见 ``_provider_tool_support``）。
         """
         umo = getattr(event, "unified_msg_origin", None)
-        get_extra = getattr(event, "get_extra", None)
-        selected = get_extra("selected_provider") if callable(get_extra) else None
-        if isinstance(selected, str) and selected:
+        selected = selected_provider_id(event)
+        if selected is not None:
             get_by_id = getattr(self.context, "get_provider_by_id", None)
             selected_provider = get_by_id(selected) if callable(get_by_id) else None
             if selected_provider is not None:
