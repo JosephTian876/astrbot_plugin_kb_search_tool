@@ -71,7 +71,20 @@
 |---|---|---|
 | `enable` | `true` | 总开关。关闭后本插件不介入任何请求。 |
 | `only_when_kb_configured` | `true` | 只在「当前会话或主配置里**配置了非空**的知识库」时注入。判定顺序与核心检索一致：会话级 `kb_config.kb_ids` 优先、主配置 `kb_names` 兜底（`core/tools/knowledge_base_tools.py`）。**不校验知识库是否存在或是否有内容**（那要读核心私有面，本插件不碰），所以 `kb_ids` 指向已删除的知识库时仍会注入，此时工具会返回 `No relevant knowledge found.`。关闭后总是注入。 |
-| `respect_provider_tool_support` | `true` | 注入前读一次「当前会话实际使用的 provider」的「模型能力（`modalities`）」：**只有**它是「非空 list 且不含 `tool_use`」时才跳过注入并 WARNING 一次（每个 provider+model 一次）。`modalities` 为 `None`／空 list／缺键／非 list、取不到 provider、读取抛异常 —— 一律按支持处理、照常注入（fail-open，与核心「未配置=默认支持全部模态」一致）；图片请求可能被核心切给 fallback provider 时同样按支持处理。关掉即回到 0.2.0 的「总是注入」。**注意「配置 ≠ 真实能力」**：模型其实支持函数调用、只是没勾「工具使用」时也会被跳过 —— 看到那条 WARNING 就去 WebUI 的 provider 设置里确认；4.23–4.26 没有 `get_using_provider_async()`，会回退同步查询（见「适用范围与边界」）。 |
+| `respect_provider_tool_support` | `true` | 注入前读一次「当前会话实际使用的 provider」的「模型能力（`modalities`）」：**只有**它是「非空 list 且不含 `tool_use`」时才跳过注入并 WARNING 一次（每个 provider+model 一次）。`modalities` 为 `None`／空 list／缺键／非 list、取不到 provider、读取抛异常 —— 一律按支持处理、照常注入（fail-open，与核心「未配置=默认支持全部模态」一致）；图片请求可能被核心切给 fallback provider 时同样按支持处理。关掉即回到 0.2.0 的「总是注入」（承诺范围见下）。**注意「配置 ≠ 真实能力」**：模型其实支持函数调用、只是没勾「工具使用」时也会被跳过 —— 看到那条 WARNING 就去 WebUI 的 provider 设置里确认；4.23–4.26 没有 `get_using_provider_async()`，会回退同步查询（见「适用范围与边界」）。 |
+
+**关掉 `respect_provider_tool_support` 之后，和 0.2.0 的差别只有两处（都已声明）**：
+
+> 不查询 provider（0 次）、注入决策与 0.2.0 完全一致、日志行为不相对于 0.2.0 变化 —— 除
+> ① 非标准 `func_tool`（别的插件换成缺 `get_tool`/`add_tool` 的对象）：0.2.0 是每请求一条
+> 带 traceback 的 ERROR，0.3.0 是一次性 WARNING + 跳过注入；② 「注入成功」那条 DEBUG
+> 末尾多了 `判定对象=…`（开关关闭时写 `未查询（respect_provider_tool_support=false）`）。
+> 两处都不影响判定结果，且 ① 只在异常输入下发生、② 只在 DEBUG 级可见。
+
+旧版 README/CHANGELOG 里"142/1260 个场景观测 JSON SHA256 完全相同"的表述已**收窄**：那套
+矩阵 harness 在仓库外、谁也无法复跑，而它恰好挡住了上面那条 ERROR 刷屏路径。现在这条承诺
+由仓库内的 `test_29` 直接钉住（provider 查询 0 次 + 注入结果相同 + 日志级别/条数/文案逐条
+相同），离线矩阵对拍降级为一次性的开发期证据。
 
 > `kb_agentic_mode=true` 时工具由核心自己添加（`core/astr_main_agent.py` 的 `_apply_kb`
 > 的 else 分支），本插件检测到同名工具已存在就什么都不做 —— 这种配置下上面三个开关都
@@ -195,6 +208,9 @@ provider」的 `modalities`，**只认一种否定信号**：
 - **图片请求会按未知处理**：`req.image_urls` 非空且主 provider 的 `modalities` 不含 `image`
   时，核心会把这次请求切给 fallback provider（`core/astr_main_agent.py:1412-1443`），
   「当前 provider 不支持工具」就不再等于「这次请求的 provider 不支持工具」，插件按支持处理。
+- **非标准 `func_tool` 已处理**（0.3.0 起）：别的插件若把 `req.func_tool` 换成缺
+  `get_tool`/`add_tool` 的自家对象，插件会**一次性 WARNING + 跳过注入**（0.2.0 是每请求一条
+  带 traceback 的 ERROR）。绝不抛异常、绝不刷屏；之后的正常请求照旧注入。
 - 知识库检索依赖外部 **embedding / rerank** 服务。网络慢时核心可能触发 120 秒工具超时
   （日志为 `tool astr_kb_search execution timeout after 120 seconds`），属环境问题。
 - 插件**不产生任何持久化数据**：不写文件、不建表、不改配置，因此重载/热重载都安全。
@@ -262,13 +278,19 @@ python -m ruff format --check .
 `pytest -q`；设置环境变量后单独跑：
 
 ```powershell
-$env:ASTRBOT_SRC = 'D:\AstrBot\backend\app'   # 4.29.1（生产源码，只读）
-& $py -m pytest tests/contract_smoke.py -q
+# ASTRBOT_SRC 要指到**包含 astrbot/ 包的那一层目录**（不是 …/astrbot 里面）
+$env:ASTRBOT_SRC = '<AstrBot 源码树>'          # 例如 <AstrBot 仓库>/backend/app
+python -m pytest tests/contract_smoke.py -q
 
 $env:ASTRBOT_SRC = '<导出目录>'                # 4.23.0（声明下界）
-& $py -m pytest tests/contract_smoke.py -q
+python -m pytest tests/contract_smoke.py -q
 # 导出下界源码树：git archive v4.23.0 astrbot | tar -x -C <导出目录>
 ```
+
+**它不会给你假绿**：父测试会把子进程输出里的 evidence JSON 抠出来，断言
+`astrbot.__file__` 反查到的包路径**严格位于** `ASTRBOT_SRC` 之下（并核对
+`provider_api` / `provider_gate`）。指错目录时子进程会静默回落到 venv 里已安装的
+AstrBot —— 那种情况下这条用例会**失败**并告诉你实际导入的是哪棵树，而不是报绿。
 
 ## 许可
 

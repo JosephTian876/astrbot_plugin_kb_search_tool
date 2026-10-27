@@ -1155,14 +1155,19 @@ def test_52_prefilter_reads_the_same_selected_provider_logic_as_the_gate(plugin_
     assert "selected_provider_id(" in source
 
 
-def test_27_non_standard_func_tool_keeps_0_2_0_behavior(plugin_module, hook, logs):
-    """非标准 ``func_tool``（缺 ``get_tool``）**未在本轮实现**：仍是"ERROR 一次 + 不注入"。
+def test_27_non_standard_func_tool_warns_once_and_skips_injection(
+    plugin_module, hook, logs
+):
+    """非标准 ``func_tool``（缺 ``get_tool``）→ **一次性 WARNING + 跳过注入**，不刷 ERROR。
 
-    为什么不顺手加防御：本轮硬约束是"开关关闭时逐字节等价 0.2.0"。给这条输入加防御会让
-    它从 ERROR 变成 DEBUG（日志可观察行为变了），等价性就不再成立；内部审计把它列为
-    "本轮不修"的残余风险（非公开契约的边缘）。
+    0.2.0 的行为是：``tool_set.get_tool(...)`` 直接 ``AttributeError``，被钩子外层吞成
+    **每请求一条带 traceback 的 ERROR**（实测 0.085 ms/请求，见 ARCH §4.4）。这是本插件
+    唯一会无限刷 ERROR 的路径，而且它与 ``respect_provider_tool_support`` 毫无关系。
 
-    本用例的价值是把现状钉成**与开关无关**：两个开关值下行为完全一致，所以等价性成立。
+    本用例钉住三件事：
+    1. 不再抛异常、不再有 ERROR；
+    2. 每个插件实例**只报一次** WARNING（3 个请求 → 1 条）；
+    3. 与开关无关（两个开关值行为一致），并且判重阶段就退出，轮不到 provider 判定。
     """
     for switch in (True, False):
         plugin, _, context, _ = make_provider_case(
@@ -1179,17 +1184,65 @@ def test_27_non_standard_func_tool_keeps_0_2_0_behavior(plugin_module, hook, log
                 self.added.append(tool)
 
         bag = FunctionToolBag()
-        req = stub.ProviderRequest(func_tool=bag)
-        hook(plugin, req)  # 不抛即通过（异常由外层 hook 吞掉）
-        assert bag.added == [], "拿不到 get_tool 就不该往里塞工具"
+        for _ in range(3):
+            req = stub.ProviderRequest(func_tool=bag)
+            hook(plugin, req)  # 不抛即通过
+            assert bag.added == [], "拿不到 get_tool 就不该往里塞工具"
         assert context.provider_calls == [], (
-            "同名判重阶段就失败了，轮不到 provider 判定"
+            "形状判重阶段就退出了，轮不到 provider 判定"
         )
 
-    errors = messages(logs, logging.ERROR)
-    assert len(errors) == 2, "每个开关值各一条：异常被外层吞掉并留痕（0.2.0 行为）"
-    assert all("get_tool" in message for message in errors)
-    assert messages(logs, logging.WARNING) == []
+    assert messages(logs, logging.ERROR) == [], "不再有每请求一条的 ERROR"
+    warnings = messages(logs, logging.WARNING)
+    assert len(warnings) == 2, "每个插件实例各一条（3 个请求也只报 1 次）"
+    assert all("get_tool" in message for message in warnings)
+    assert all("FunctionToolBag" in message for message in warnings), (
+        "文案要点明实际类型，用户才知道是谁换的"
+    )
+    assert all("只提示一次" in message for message in warnings)
+
+
+def test_27b_non_standard_func_tool_missing_add_tool_too(plugin_module, hook, logs):
+    """另一种形状：有 ``get_tool`` 但**没有** ``add_tool`` —— 同样一次性 WARNING + 跳过。
+
+    这条以前会在 ``add_tool`` 处抛 ``AttributeError``（每请求一条 ERROR）。只探测
+    ``get_tool`` 是不够的：追加那一步也要能安全失败。
+    """
+
+    class GetOnlyBag:
+        def get_tool(self, name):
+            return None
+
+    plugin, _, context, _ = make_provider_case(plugin_module, ["text", "tool_use"])
+    bag = GetOnlyBag()
+    for _ in range(3):
+        hook(plugin, stub.ProviderRequest(func_tool=bag))
+
+    assert messages(logs, logging.ERROR) == []
+    warnings = messages(logs, logging.WARNING)
+    assert len(warnings) == 1
+    assert "GetOnlyBag" in warnings[0]
+    assert context.provider_calls == [], "形状不对时不该继续往下走"
+
+
+def test_27c_non_standard_func_tool_does_not_poison_later_requests(
+    plugin_module, hook, logs
+):
+    """一次性 WARNING 之后，正常请求照旧注入（不能因为报过一次就永久停摆）。"""
+    plugin, _, _, tool = make_plugin(plugin_module, kb_names=["kb1"])
+
+    class Weird:
+        pass
+
+    hook(plugin, stub.ProviderRequest(func_tool=Weird()))
+    assert len(messages(logs, logging.WARNING)) == 1
+
+    req = stub.ProviderRequest()
+    hook(plugin, req)
+    assert req.func_tool is not None
+    assert req.func_tool.get_tool(plugin_module.KB_TOOL_NAME) is tool
+    assert len(messages(logs, logging.WARNING)) == 1, "正常请求不该再报一次"
+    assert messages(logs, logging.ERROR) == []
 
 
 def test_28_conf_schema_and_plugin_read_the_same_config_keys(plugin_module):

@@ -119,10 +119,15 @@ def test_40_probe_and_contract_smoke_have_no_machine_specific_paths():
     ``contract_smoke.py`` 的假绿守卫另见 ``tests/test_contract_evidence.py``。
     """
     markers = ("D:\\UwU", "dshworkdir", "D:\\AstrBot", "fix-venv", "C:\\Users")
-    for name in ("tests/probe_core_config.py", "tests/contract_smoke.py"):
+    # README 也一起查：它的"契约冒烟"示例是用户照着抄的，写死别人的路径同样不可复跑
+    # （而且那份示例里的 `$py` 曾经没有任何地方定义过）。
+    for name in ("tests/probe_core_config.py", "tests/contract_smoke.py", "README.md"):
         text = (REPO_ROOT / name).read_text(encoding="utf-8")
         for marker in markers:
             assert marker not in text, f"{name} 里还有本机路径: {marker}"
+
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "$py" not in readme, "示例里的 $py 从来没有定义过，用户照抄会失败"
 
     probe = (REPO_ROOT / "tests" / "probe_core_config.py").read_text(encoding="utf-8")
     # 仓库根必须由 __file__ 反推（换克隆目录不用改代码）。
@@ -275,3 +280,62 @@ def test_61_readme_carries_the_full_judgement_that_left_the_panel_hint():
     respect_hint = schema["respect_provider_tool_support"]["hint"]
     assert "fallback" not in respect_hint
     assert "4.23" not in respect_hint
+
+
+def test_62_equivalence_promise_is_narrowed_and_names_its_exceptions():
+    """P2-3：与 0.2.0 的等价承诺必须**收窄**，且把已声明的差异写清楚。
+
+    旧口径是"142/1260 个场景观测 JSON SHA256 完全相同"—— 那套 harness 在仓库外、谁也无法
+    复跑，而它恰好唯一挡住了"非标准 `func_tool` 每请求刷 ERROR"这条路径。新口径只承诺
+    **能在这里复验的三件事**：不查询 provider、注入决策一致、日志行为不变（除已声明的
+    两处）。这条用例钉住措辞与那两处差异都在，避免哪天又漂回不可复跑的表述。
+    """
+    for name in ("CHANGELOG.md", "README.md"):
+        text = (REPO_ROOT / name).read_text(encoding="utf-8")
+        # 承诺的三个可复验部分。
+        assert "注入决策与 0.2.0 完全一致" in text, f"{name} 缺'注入决策'承诺"
+        assert "日志行为不相对于 0.2.0" in text, f"{name} 缺'日志行为'承诺"
+        assert "不查询 provider（0 次）" in text, f"{name} 缺「不查询 provider」承诺"
+        # 两处已声明的差异都必须写明（否则承诺就是空头支票）。
+        assert "非标准 `func_tool`" in text, f"{name} 没写第 1 处已声明差异"
+        assert "判定对象" in text, f"{name} 没写第 2 处已声明差异"
+        # 旧口径必须消失：它既不可复跑，又被本版的行为变化推翻。
+        # （允许在"为什么改口径"那一段里**引用**旧措辞，但那时段落里必须写明是旧版本写的。）
+        assert "逐字节回到 0.2.0" not in text, f"{name} 还留着旧的'逐字节'口径"
+        for paragraph in text.split("\n\n"):
+            if "SHA256" in paragraph:
+                assert "旧版" in paragraph, (
+                    f"{name} 里仍把 SHA256 当作承诺在陈述，而不是在解释旧措辞:\n{paragraph}"
+                )
+
+    changelog = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert "一次性 WARNING" in changelog, "行为变化本身要写进 CHANGELOG"
+    assert "每请求一条带 traceback 的 ERROR" in changelog, "要写清旧行为是什么"
+
+
+def test_63_promise_is_backed_by_a_runnable_test_not_by_the_offline_matrix():
+    """承诺必须由**仓库内**的用例钉住：``test_29`` 断言 provider 0 次 + 日志逐条相同。
+
+    这条是结构钉：如果哪天有人删掉 ``test_29``（或把它改成只断言"注入了"），承诺就又变成
+    口头保证。这里同时钉住它覆盖了 modalities 的各种形态与有无知识库两个维度。
+    """
+    source = (REPO_ROOT / "tests" / "test_main.py").read_text(encoding="utf-8")
+
+    name = "def test_29_switch_off_is_observably_identical_to_0_2_0"
+    assert name in source
+    start = source.index(name)
+    # 装饰器在 def 之前：往前多取一段，后面截到下一个 def。
+    block = source[max(0, start - 600) : start]
+    block += source[start : source.index("\ndef ", start)]
+    assert "@pytest.mark.parametrize" in block, (
+        "test_29 必须是参数化矩阵，不能只测一种形态"
+    )
+    assert '"modalities"' in block and '"kb_names"' in block, (
+        "test_29 要覆盖 modalities 的各种形态与有无知识库两个维度"
+    )
+    assert 'config={"respect_provider_tool_support": False}' in block
+    assert "provider_calls == []" in block, "必须断言 provider 一次都没查"
+    assert "messages(logs, logging.DEBUG) ==" in block, "必须逐字断言日志"
+    assert "_ProviderMustNotBeTouched" in source, (
+        "开关关闭时要用 BaseException 陷阱证明'一次都没碰 provider'"
+    )

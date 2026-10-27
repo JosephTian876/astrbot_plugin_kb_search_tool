@@ -183,6 +183,7 @@ class KBSearchToolPlugin(Star):
         self._resolve_failed = False
         self._resolve_missing = False
         self._warned_no_kb = False
+        self._warned_non_standard_tool_set = False
         self._unknown_logged: set[str] = set()
         #: "明确不支持工具"的 WARNING 去重键 ``(provider_id, model)``：用户切了模型要再说一次。
         self._warned_unsupported: set[tuple[str, str]] = set()
@@ -272,9 +273,19 @@ class KBSearchToolPlugin(Star):
             return  # 原因与补救办法已由 _resolve_tool 打过一次
 
         tool_set = req.func_tool
-        if tool_set is not None and tool_set.get_tool(KB_TOOL_NAME) is not None:
-            # 核心 agentic 模式或别的钩子已加过：不重复添加，也不替换别人的实例。
-            return
+        if tool_set is not None:
+            # 非标准 ``func_tool``（别的插件换成了缺 get_tool/add_tool 的对象）：0.2.0 会在
+            # 这里 AttributeError，被钩子外层吞成**每请求一条 ERROR + traceback**。那既是
+            # 唯一会无限刷 ERROR 的路径，也与 respect_provider_tool_support 毫无关系。
+            # 现在改为：一次性 WARNING（说清是谁的形状不对）+ 跳过注入，绝不抛异常。
+            get_tool = getattr(tool_set, "get_tool", None)
+            add_tool = getattr(tool_set, "add_tool", None)
+            if not callable(get_tool) or not callable(add_tool):
+                self._warn_non_standard_tool_set_once(tool_set)
+                return
+            if get_tool(KB_TOOL_NAME) is not None:
+                # 核心 agentic 模式或别的钩子已加过：不重复添加，也不替换别人的实例。
+                return
 
         if self.only_when_kb_configured and not await self._kb_available(event):
             if not self._warned_no_kb:
@@ -289,7 +300,7 @@ class KBSearchToolPlugin(Star):
         # 放在最后一步之前：只有"确实要注入"的请求才付这次判定成本（知识库判定更常见）。
         if self.respect_provider_tool_support:
             # O1 静态预筛：已加载的 chat provider 里没人声明"缺 tool_use"时，无论核心这次
-            # 解析到哪一个，判定结果都只能是"支持" —— 那次 DB 点查（实测约 1.12 ms）可以
+            # 解析到哪一个，判定结果都只能是"支持" —— 那次 DB 点查（实测约 1.1–1.2 ms）可以
             # 整段跳过。预筛证明不了就照旧查一次，绝不改变"判定为不支持"的语义。
             if self._static_prefilter_proves_support(event):
                 judged = "未查询（静态预筛：已加载 provider 均未声明缺 tool_use）"
@@ -314,6 +325,29 @@ class KBSearchToolPlugin(Star):
         # provider/model，而不是只知道"注入了"。没查时不编造，写明原因。
         logger.debug(
             "[KBTool] 注入 %s，工具数=%d，判定对象=%s", KB_TOOL_NAME, tool_count, judged
+        )
+
+    def _warn_non_standard_tool_set_once(self, tool_set: object) -> None:
+        """非标准 ``func_tool``（缺 ``get_tool``/``add_tool``）：一次性 WARNING + 跳过注入。
+
+        为什么用 WARNING 而不是 DEBUG（二选一，理由在此）：
+        - 这是一条"**插件不工作了**"的可见原因 —— 工具不会被注入，而用户能看到的唯一线索
+          就是这条日志。DEBUG 在默认 INFO 级别下不可见，等于把故障藏起来（本插件其它
+          静默失效路径都被专门修过，见内置工具注册表返回 None 那条 WARNING）。
+        - 它不刷屏：**每个插件实例只报一次**（``_warned_non_standard_tool_set``），与
+          "每请求一条带 traceback 的 ERROR"（0.2.0 的行为）相比是纯降噪。
+        - 文案给不出"用户能照做的下一步"？能给：指出是**别的插件**换了 ``func_tool`` 对象，
+          让用户去查最近装的插件；本插件能做的是安全跳过，不是替它修对象。
+        """
+        if self._warned_non_standard_tool_set:
+            return
+        self._warned_non_standard_tool_set = True
+        logger.warning(
+            "[KBTool] 本次请求的 func_tool 是 %s（缺 get_tool/add_tool），不是核心的 ToolSet；"
+            "本插件无法安全判重与追加，已跳过注入（本条只提示一次）。"
+            "通常意味着另一个插件把 req.func_tool 换成了自定义对象 —— "
+            "请检查最近安装/更新的插件。",
+            type(tool_set).__name__,
         )
 
     def _resolve_tool(self) -> FunctionTool | None:
@@ -379,7 +413,7 @@ class KBSearchToolPlugin(Star):
 
         ``True`` = 已加载的 chat provider 里没有任何一个声明"缺 ``tool_use``"，于是无论核心
         这次解析到哪一个，``_provider_tool_support`` 都只会返回 ``True`` —— 那次 DB 点查
-        （实测 median 约 1.36 ms/请求）可以整段跳过。
+        （两次独立跑：median 1.1247 / 1.1975 ms）可以整段跳过。
 
         ``False`` = **证明不了**，调用方照旧查一次。这条路径没有任何"判为不支持"的能力：
         最坏结果只是多查一次 DB，所以它不可能放宽 ``respect_provider_tool_support``。
