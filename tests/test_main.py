@@ -35,18 +35,25 @@ class FakeToolManager:
 
     与核心一致：``get_builtin_tool`` 按名返回**同一个缓存实例**（核心用
     ``builtin_func_list`` 按类缓存），所以"注入的就是核心那一个"可以用 ``is`` 断言。
-    ``raises`` 用来模拟内置工具注册表不可用。
+    ``raises`` 用来模拟内置工具注册表不可用；``returns_none`` 模拟"注册表可用、但这个名字
+    没登记"（VERIFY-KB-R3 §9 P3-2：实测核心只会抛异常，所以这属**理论**分支，但它一旦发生
+    就是零日志静默失效，必须有回归钉）。
     """
 
-    def __init__(self, tool, *, raises: Exception | None = None) -> None:
+    def __init__(
+        self, tool, *, raises: Exception | None = None, returns_none: bool = False
+    ) -> None:
         self._tool = tool
         self.raises = raises
+        self.returns_none = returns_none
         self.calls = 0
 
     def get_builtin_tool(self, name: str):
         self.calls += 1
         if self.raises is not None:
             raise self.raises
+        if self.returns_none:
+            return None
         assert name == self._tool.name, f"插件请求了意外的工具名: {name}"
         return self._tool
 
@@ -160,6 +167,7 @@ def make_plugin(
     config: dict | None = None,
     kb_names: list[str] | None = None,
     tool_raises: Exception | None = None,
+    tool_returns_none: bool = False,
     config_raises: Exception | None = None,
     provider=None,
     provider_api=(),
@@ -168,7 +176,7 @@ def make_plugin(
 ):
     """构造被测插件，返回 ``(plugin, manager, context, tool)``。"""
     tool = stub.FunctionTool(plugin_module.KB_TOOL_NAME)
-    manager = FakeToolManager(tool, raises=tool_raises)
+    manager = FakeToolManager(tool, raises=tool_raises, returns_none=tool_returns_none)
     context = FakeContext(
         manager,
         kb_names=kb_names,
@@ -1012,3 +1020,270 @@ def test_30_only_when_kb_configured_off_injects_without_kb(plugin_module, hook, 
     warnings = messages(logs, logging.WARNING)
     assert len(warnings) == 1 and "tool_use" in warnings[0]
     assert messages(logs, logging.ERROR) == []
+
+
+# ---------------------------------------------------------------------------
+# 配置值健壮性（P2-1，R4 必修）
+#
+# 实测的反例（VERIFY-KB-R3 §9 P2-1）：手改 ``_conf_schema.json`` 里
+# ``respect_provider_tool_support: "false"`` 时 ``bool("false") is True`` → 闸门**仍然开**，
+# 用户的意图被静默反转；键名拼错则整项被静默忽略、用户以为生效了。
+# 修法：布尔值走显式白名单，认不出就用默认值 + 一次性 WARNING；未知键同样一次性 WARNING。
+# ---------------------------------------------------------------------------
+
+#: 三个布尔配置键 → ``(插件属性名, 默认值)``（与 ``_conf_schema.json`` 一致）。
+#: 注意 ``enable`` 这个键落到的属性叫 ``enabled``（0.1.0 起的历史命名，改名会破坏兼容）。
+BOOL_SETTINGS = {
+    "enable": ("enabled", True),
+    "only_when_kb_configured": ("only_when_kb_configured", True),
+    "respect_provider_tool_support": ("respect_provider_tool_support", True),
+}
+
+#: 白名单：这些写法必须**逐字节**等价于对应的真 bool。
+BOOL_TOKENS = [
+    (True, True),
+    (False, False),
+    (1, True),
+    (0, False),
+    ("1", True),
+    ("0", False),
+    ("true", True),
+    ("false", False),
+    ("TRUE", True),
+    ("False", False),
+    (" true ", True),
+    ("yes", True),
+    ("no", False),
+    ("on", True),
+    ("off", False),
+]
+
+
+@pytest.mark.parametrize("key", sorted(BOOL_SETTINGS))
+@pytest.mark.parametrize(("value", "expected"), BOOL_TOKENS)
+def test_32_bool_settings_accept_the_explicit_whitelist(
+    plugin_module, logs, key, value, expected
+):
+    """白名单内的写法（含真 bool）都按值解析，且**不**产生告警。
+
+    真 bool 的路径必须与 0.2.0 逐字节相同：``test_23``/``test_29`` 的等价性正是建立在
+    "真 bool 不做任何额外动作"上。
+    """
+    attr, _ = BOOL_SETTINGS[key]
+    plugin, _, _, _ = make_plugin(plugin_module, config={key: value})
+
+    assert getattr(plugin, attr) is expected
+    assert messages(logs, logging.WARNING) == [], "白名单内的值不该告警"
+    assert messages(logs, logging.ERROR) == []
+
+
+@pytest.mark.parametrize("key", sorted(BOOL_SETTINGS))
+@pytest.mark.parametrize(
+    "value", ["FALSE!", "maybe", "2", 2, -1, 1.5, None, [], {"enabled": False}, ""]
+)
+def test_33_unrecognized_bool_value_uses_the_default_with_one_warning(
+    plugin_module, logs, key, value
+):
+    """认不出的值 → 用**默认值**（不是"真值"），并一次性 WARNING 说清后果。
+
+    ``None``/``""``/``2``/``1.5``/容器都在表里：它们都能被 ``bool()`` 悄悄变成 True 或
+    False，而用户真正想说的值不可知 —— 这时唯一安全的做法是回到默认值并明说。
+    """
+    attr, default = BOOL_SETTINGS[key]
+    plugin, _, _, _ = make_plugin(plugin_module, config={key: value})
+
+    assert getattr(plugin, attr) is default
+    warnings = messages(logs, logging.WARNING)
+    assert len(warnings) == 1, f"{value!r} 应恰好一条告警，实际 {warnings}"
+    assert key in warnings[0], "告警必须指出是哪个键"
+    assert "无法识别" in warnings[0], "告警必须说明原因，而不是静默"
+    assert str(default) in warnings[0], "告警必须说明实际用了哪个默认值"
+    assert messages(logs, logging.ERROR) == []
+
+
+def test_33b_unrecognized_bool_warns_once_per_plugin_not_per_request(
+    plugin_module, hook, logs
+):
+    """告警只出现在加载期一次：连续 3 个请求不再重复（否则就是刷屏）。"""
+    plugin, _, _, _ = make_plugin(
+        plugin_module,
+        kb_names=["kb1"],
+        config={"respect_provider_tool_support": "maybe"},
+        provider=FakeProvider({"id": "p", "model": "m", "modalities": ["text"]}),
+        provider_api=("async",),
+    )
+
+    for _ in range(3):
+        req = stub.ProviderRequest()
+        hook(plugin, req)
+        assert req.func_tool is None, "取值失败后回落默认 True，闸门照常生效"
+
+    config_warnings = [
+        message for message in messages(logs, logging.WARNING) if "无法识别" in message
+    ]
+    assert len(config_warnings) == 1, f"只该有加载期那一条，实际 {config_warnings}"
+    # 闸门本身仍然按默认 True 生效，所以另有 1 条「未勾 tool_use」的 provider 告警
+    # （它按 provider+model 去重，3 次请求只 1 条）—— 两类告警互不干扰。
+    assert len(messages(logs, logging.WARNING)) == 2
+    assert messages(logs, logging.ERROR) == []
+    assert plugin.respect_provider_tool_support is True
+
+
+@pytest.mark.parametrize("token", ["false", "0", "no", "off", "FALSE"])
+def test_34_string_false_really_closes_the_provider_gate(
+    plugin_module, hook, logs, token
+):
+    """P2-1 的**用户可见**修复：字符串 ``"false"`` 必须真的关掉闸门。
+
+    做法与 ``test_29`` 相同：把 provider 查询装成"一碰就抛 ``BaseException``"的陷阱。
+    修复前的 ``bool("false")`` 为 True → 陷阱会被踩中；修复后一次都不该被调用。
+    """
+    plugin, _, context, tool = make_plugin(
+        plugin_module,
+        kb_names=["kb1"],
+        config={"respect_provider_tool_support": token},
+        provider=FakeProvider({"id": "p", "model": "m", "modalities": ["text"]}),
+        provider_api=("async", "sync", "by_id"),
+        provider_error=_ProviderMustNotBeTouched("字符串 false 必须关闭闸门"),
+    )
+
+    req = stub.ProviderRequest()
+    hook(plugin, req)
+
+    assert plugin.respect_provider_tool_support is False
+    assert context.provider_calls == [], "闸门已关：一次 provider 查询都不该发生"
+    assert req.func_tool is not None, "闸门关闭 → 回到 0.2.0 的「总是注入」"
+    assert req.func_tool.get_tool(plugin_module.KB_TOOL_NAME) is tool
+    assert messages(logs, logging.WARNING) == []
+    assert messages(logs, logging.ERROR) == []
+
+
+def test_35_unknown_config_key_warns_once_and_is_ignored(plugin_module, hook, logs):
+    """拼错的键名（``respect_provider_tools_support``）→ 一次性 WARNING，不静默吞掉。
+
+    这是 P2-1 的另一半：用户以为自己改的是闸门，实际写了个不存在的键。没有 schema 校验的
+    情况下，唯一能让人发现这件事的就是一条把**拼错的名字**和**可用键**都列出来的告警。
+    """
+    typo = "respect_provider_tools_support"  # tool 后面多了一个 s
+    plugin, _, _, _ = make_plugin(plugin_module, kb_names=["kb1"], config={typo: False})
+
+    assert plugin.respect_provider_tool_support is True, "拼错的键不该生效"
+    warnings = messages(logs, logging.WARNING)
+    assert len(warnings) == 1, f"未知键应恰好一条告警，实际 {warnings}"
+    assert typo in warnings[0], "告警必须列出拼错的那个键"
+    assert "respect_provider_tool_support" in warnings[0], "告警要给出可用键"
+    assert "enable" in warnings[0] and "only_when_kb_configured" in warnings[0]
+
+    for _ in range(3):  # 请求期不再重复
+        hook(plugin, stub.ProviderRequest())
+    assert len(messages(logs, logging.WARNING)) == 1
+    assert messages(logs, logging.ERROR) == []
+
+
+def test_35b_unknown_config_keys_are_listed_in_one_warning(plugin_module, logs):
+    """多个未知键合成**一条**告警（键名全部列出），不是一个键一条。"""
+    # 构造插件这一步本身就会触发告警（告警在 __init__ 里，不依赖任何请求）。
+    make_plugin(
+        plugin_module,
+        config={"enable": True, "enalbe": False, "only_when_kb_configured": "maybe"},
+    )
+
+    warnings = messages(logs, logging.WARNING)
+    assert len(warnings) == 2, "一条未知键 + 一条取值无法识别（各自一次）"
+    unknown = [message for message in warnings if "enalbe" in message]
+    assert len(unknown) == 1
+    assert messages(logs, logging.ERROR) == []
+
+
+# ---------------------------------------------------------------------------
+# 其余 P3 收口（VERIFY-KB-R3 §9）
+# ---------------------------------------------------------------------------
+
+
+def test_36_registry_returning_none_warns_once_and_self_heals(
+    plugin_module, hook, logs
+):
+    """P3-2：``get_builtin_tool`` 返回 ``None``（不是抛异常）→ 一次性 WARNING，不静默失效。
+
+    与"抛异常"分支（``test_08``）区分开：那条是 ERROR 且文案指向版本/注册表，这条是
+    "名字没登记"的 WARNING —— 两种原因的修法不同，日志不能混成一句。
+    """
+    plugin, manager, _, tool = make_plugin(
+        plugin_module, kb_names=["kb1"], tool_returns_none=True
+    )
+
+    warnings = messages(logs, logging.WARNING)
+    assert len(warnings) == 1, f"返回 None 必须有且只有一条 WARNING，实际 {warnings}"
+    assert plugin_module.KB_TOOL_NAME in warnings[0]
+    assert "None" in warnings[0], "文案要点明是返回 None，而不是异常"
+    assert messages(logs, logging.ERROR) == [], "返回 None 不是异常，不该用 ERROR"
+
+    # 请求期：不注入、也不再重复告警（每个请求都会重试，重试不能刷屏）。
+    for _ in range(2):
+        req = stub.ProviderRequest()
+        hook(plugin, req)
+        assert req.func_tool is None
+    assert len(messages(logs, logging.WARNING)) == 1
+    assert manager.calls == 3, "启动一次 + 每次请求各重试一次（自愈的前提）"
+
+    # 注册表恢复 → 下一个请求自动注入，不需要重载插件。
+    manager.returns_none = False
+    req = stub.ProviderRequest()
+    hook(plugin, req)
+    assert req.func_tool is not None
+    assert req.func_tool.get_tool(plugin_module.KB_TOOL_NAME) is tool
+
+
+def test_37_exception_dedupe_uses_the_message_summary(plugin_module, hook, logs):
+    """P3-1：异常去重键 = 类型 + 消息摘要，同类型不同原因**各留一条**。
+
+    实测（VERIFY-KB-R3 §7 表「同一异常类型、两种原因」）：只按类型去重时第二条被静默吞掉，
+    排障时看不到真正的原因。同一句话重复出现仍只记一条（去重本身要保住）。
+    """
+    plugin, _, context, tool = make_plugin(
+        plugin_module,
+        kb_names=["kb1"],
+        provider_api=("async",),
+        provider_error=RuntimeError("first reason"),
+    )
+
+    def run_once() -> None:
+        req = stub.ProviderRequest()
+        hook(plugin, req)
+        assert req.func_tool is not None and (
+            req.func_tool.get_tool(plugin_module.KB_TOOL_NAME) is tool
+        )
+
+    run_once()
+    context.provider_error = RuntimeError("second reason")
+    run_once()
+    run_once()  # 同一句话重复：不该再记
+
+    debug = [
+        message for message in messages(logs, logging.DEBUG) if "按支持处理" in message
+    ]
+    assert len(debug) == 2, f"两种原因各一条，实际 {debug}"
+    assert any("first reason" in message for message in debug)
+    assert any("second reason" in message for message in debug)
+    assert messages(logs, logging.ERROR) == [], "探测异常必须自己吞掉"
+
+
+def test_37b_exception_summary_is_truncated_to_80_chars(plugin_module, hook, logs):
+    """超长异常消息只取前 80 字进去重键：避免键无限长，也避免截断后两条撞在一起。"""
+    long_a = "x" * 200 + "A"
+    long_b = "x" * 200 + "B"  # 前 80 字与 long_a 相同 → 视为同一原因（去重）
+
+    plugin, _, context, _ = make_plugin(
+        plugin_module,
+        kb_names=["kb1"],
+        provider_api=("async",),
+        provider_error=RuntimeError(long_a),
+    )
+    hook(plugin, stub.ProviderRequest())
+    context.provider_error = RuntimeError(long_b)
+    hook(plugin, stub.ProviderRequest())
+
+    debug = [
+        message for message in messages(logs, logging.DEBUG) if "按支持处理" in message
+    ]
+    assert len(debug) == 1, "前 80 字相同时应视为同一原因（键不能无限增长）"

@@ -37,6 +37,39 @@ IMAGE_MODALITY = "image"
 #: ``provider_config`` 里没有 ``modalities`` 这个键（与"键存在但值是 None"区分开）。
 _MODALITIES_MISSING = object()
 
+#: 插件认识的配置键。多出来的键（拼写错误）会一次性 WARNING，而不是静默忽略 ——
+#: 用户以为改的是闸门、实际写了个不存在的名字，是这一类配置最难自查的故障。
+_KNOWN_CONFIG_KEYS = frozenset(
+    {"enable", "only_when_kb_configured", "respect_provider_tool_support"}
+)
+
+#: 布尔配置值的显式白名单。``bool("false") is True`` 会静默反转用户意图（手改 JSON 时
+#: 最常见），所以**不用** ``bool()`` 做解析：只认这些写法，其余一律按"无法识别"处理。
+_TRUE_TOKENS = frozenset({"1", "true", "yes", "on"})
+_FALSE_TOKENS = frozenset({"0", "false", "no", "off"})
+
+
+def parse_bool_setting(value: object) -> bool | None:
+    """把配置里的布尔值解析成 ``bool``；认不出返回 ``None``（由调用方回落到默认值）。
+
+    认的写法：真 ``bool``、整数 ``1``/``0``、以及（忽略大小写与首尾空白的）
+    ``"1"``/``"0"``/``"true"``/``"false"``/``"yes"``/``"no"``/``"on"``/``"off"``。
+
+    为什么不去猜：``1.5``/``2``/``[]``/``{}``/``"maybe"`` 这些值的"真值"纯属 Python 语义
+    巧合，用户真正想要的多半是另一个值 —— 回到默认值并告警一次，比猜错后反向生效安全。
+    """
+    if isinstance(value, bool):  # 必须先于 int：bool 是 int 的子类
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in _TRUE_TOKENS:
+            return True
+        if token in _FALSE_TOKENS:
+            return False
+    return None
+
 
 class KBSearchToolPlugin(Star):
     """把内置的知识库检索工具常驻到每次 LLM 请求。"""
@@ -44,19 +77,21 @@ class KBSearchToolPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
         raw = dict(config or {})
-        self.enabled: bool = bool(raw.get("enable", True))
-        self.only_when_kb_configured: bool = bool(
-            raw.get("only_when_kb_configured", True)
+        self.enabled: bool = self._read_bool(raw, "enable", True)
+        self.only_when_kb_configured: bool = self._read_bool(
+            raw, "only_when_kb_configured", True
         )
         #: 注入前尊重 provider 的「模型能力」声明：只有**明确**没勾 ``tool_use`` 才跳过。
-        self.respect_provider_tool_support: bool = bool(
-            raw.get("respect_provider_tool_support", True)
+        self.respect_provider_tool_support: bool = self._read_bool(
+            raw, "respect_provider_tool_support", True
         )
+        self._warn_unknown_config_keys(raw)
         #: 缓存的核心工具实例；``None`` = 上次没取到，下个请求会再试（自愈）。
         self._tool: FunctionTool | None = None
-        # 三个"只报一次"的标记：取工具失败、无知识库、provider 判定里的同一种未知原因
-        # 实测每请求都会命中，逐次打会刷屏。
+        # 四个"只报一次"的标记：取工具抛异常、取工具返回 None、无知识库、provider 判定里的
+        # 同一种未知原因 —— 实测每请求都会命中，逐次打会刷屏。
         self._resolve_failed = False
+        self._resolve_missing = False
         self._warned_no_kb = False
         self._unknown_logged: set[str] = set()
         #: "明确不支持工具"的 WARNING 去重键 ``(provider_id, model)``：用户切了模型要再说一次。
@@ -66,6 +101,54 @@ class KBSearchToolPlugin(Star):
         # 启动即解析一次，让"核心没注册该工具"当场暴露，而不是等第一个请求静默不注入。
         # 放在 INFO 之后：故障时日志最后一行是 ERROR，不会被"宣示成功"盖住。
         self._resolve_tool()
+
+    @staticmethod
+    def _read_bool(raw: dict, key: str, default: bool) -> bool:
+        """读一个布尔配置项：走显式白名单，认不出就用默认值并**告警一次**。
+
+        只在 ``__init__`` 里调用（启动/重载各一次），因此天然不会按请求刷屏。
+        真 ``bool`` 走的是第一个分支、原样返回 —— 与 0.2.0 的行为逐字节相同，
+        这是"开关关闭 == 0.2.0"等价性的前提。
+        """
+        value = raw.get(key, default)
+        parsed = parse_bool_setting(value)
+        if parsed is not None:
+            return parsed
+        logger.warning(
+            "[KBTool] 配置项 %s 的值无法识别（%s=%r），已按默认 %s 处理；"
+            '请填 JSON 布尔值 true/false（也认 1/0 与 "true"/"false"/"yes"/"no"/'
+            '"on"/"off"）。',
+            key,
+            type(value).__name__,
+            value,
+            default,
+        )
+        return default
+
+    @staticmethod
+    def _warn_unknown_config_keys(raw: dict) -> None:
+        """未知配置键（多半是拼写错误）一次性列出，避免"改了却没生效"。
+
+        **真实环境的实际情况（实测，不是推测）**：正常加载路径上核心的 ``AstrBotConfig``
+        已经先一步把 schema 之外的键**删掉并写回文件**，同时打一条 INFO
+        （4.29.1 ``Config key removed: <key>``；4.23.0 ``检查到配置项 <key> 不存在，将从
+        当前配置中删除``）—— 所以这条 WARNING 在正常安装里通常**不会**出现。它守的是另外
+        两种入口：核心直接把 dict 交给插件（测试、第三方加载器、契约冒烟），以及将来核心
+        改变清理行为。多一条自述性告警的成本可以忽略，而"改了没生效且没人说"很难自查。
+        证据：``tests/probe_core_config.py``（在两个真实版本树上各跑一次）。
+
+        只提示、不改行为：真正的开关仍由上面三个已知键决定。``str(key)`` 兜底是因为
+        配置理论上可能来自非 JSON 来源（键不是 ``str`` 时 ``sorted`` 会直接抛）。
+        """
+        unknown = sorted(str(key) for key in raw if key not in _KNOWN_CONFIG_KEYS)
+        if not unknown:
+            return
+        logger.warning(
+            "[KBTool] 配置里有无法识别的键：%s（已忽略）；可用键只有：%s。"
+            "键名拼错时那一项不会生效，请对照插件配置页核对。",
+            "、".join(unknown),
+            "、".join(sorted(_KNOWN_CONFIG_KEYS)),
+        )
 
     @filter.on_llm_request(priority=HOOK_PRIORITY)
     async def on_llm_request(
@@ -122,6 +205,10 @@ class KBSearchToolPlugin(Star):
 
         失败时**不**永久停用自己：``get_builtin_tool`` 会顺带导入全部内置工具模块，任一模块
         导入失败都会让启动瞬间取不到工具；环境修好后应当自愈，而不是整个进程寿命内静默失效。
+
+        两条失败路径分开报（修法不同）：**抛异常**用 ERROR（注册表/导入坏了），
+        **返回 None** 用 WARNING（名字没登记，实测核心只会抛异常，所以这属理论分支，
+        但它一旦发生就是"每请求重试 + 零日志"的静默失效）。
         """
         if self._tool is not None:
             return self._tool
@@ -137,6 +224,17 @@ class KBSearchToolPlugin(Star):
                     "请确认 AstrBot >= 4.23 且核心内置工具可正常导入。",
                     KB_TOOL_NAME,
                     exc,
+                )
+            return None
+        if self._tool is None:
+            # 与异常分支区别：这里注册表本身是好用的，只是没能给出这个名字。
+            if not self._resolve_missing:
+                self._resolve_missing = True
+                logger.warning(
+                    "[KBTool] 内置工具注册表返回 None（没有抛异常），即当前核心没有登记 %s；"
+                    "本次及后续请求都会自动重试，暂时不注入。"
+                    "请确认 AstrBot >= 4.23 且该内置工具未被移除。",
+                    KB_TOOL_NAME,
                 )
             return None
         return self._tool
@@ -216,8 +314,11 @@ class KBSearchToolPlugin(Star):
             self._warn_unsupported_once(provider, config)
             return False
         except Exception as exc:  # noqa: BLE001 - 探测失败必须 fail-open（AUDIT-KB §3.6）
+            # 去重键 = 类型 + 消息前 80 字：只按类型去重时，"同类型不同原因"只留第一条，
+            # 排障时看不到真正的原因（VERIFY-KB-R3 §9 P3-1）。截断保证键不会无限长。
             return self._assume_supported(
-                f"exc:{type(exc).__name__}", f"{type(exc).__name__}: {exc}"
+                f"exc:{type(exc).__name__}:{str(exc)[:80]}",
+                f"{type(exc).__name__}: {exc}",
             )
 
     async def _actual_provider(self, event: AstrMessageEvent) -> tuple[bool, object]:
@@ -234,7 +335,8 @@ class KBSearchToolPlugin(Star):
           ``getattr`` 探测 + 回退 —— 无条件 ``await`` 会在声明下界上每请求 ``AttributeError``。
         - 同步版内部走 ``sp.get`` 的**专用同步 SQLite 连接**做一次点查（``shared_preferences``
           注明"briefly blocks the calling thread"，但不碰 async 连接池、不会死锁事件循环），
-          实测约 1 ms；只有 4.27.5 以下才会走到。
+          实测 median **1.6158 ms**（p95 2.2301 ms），期间同 loop 的其他协程得不到调度；
+          **只有 4.23–4.26** 会走到（4.27.5+ 有 async 版，实测 median 1.0791 ms、不阻塞）。
         - 两个方法都没有 → ``(False, None)``：调用方静默放行（见 ``_provider_tool_support``）。
         """
         umo = getattr(event, "unified_msg_origin", None)
