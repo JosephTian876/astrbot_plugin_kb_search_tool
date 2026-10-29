@@ -1,0 +1,79 @@
+name: CI
+
+# 这两条门禁与 README「开发」一节的三条命令逐字对应，不多也不少：
+#   python -m pytest -q
+#   python -m ruff check .
+#   python -m ruff format --check .
+#
+# 刻意**不设** ASTRBOT_SRC：它只用于发布前拿真实 AstrBot 源码树做一次对拍
+# （README「开发」明确要求日常门禁不要设），设了会让 test_contract_smoke 去加载
+# 核心，这里没有核心可加载。所以日常门禁的预期结果就是「246 passed, 1 skipped」。
+
+on:
+  push:
+    branches: [main, "fix/**", "feat/**", "ci/**"]
+    paths-ignore: ["**/*.md", "logo.png"]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支连续推送时取消旧的一跑
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint (ruff 0.15.22)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 必须 pin。ruff 不定版本时，上游加规则会在源码一行没改的情况下把门禁
+      # 变红；0.15.22 是 AstrBot 本体与同作者 astrbot_plugin_video_vision 用的
+      # 同一个版本。（本仓库在 0.15.22 与 0.17.3 上当前都通过，pin 是为了
+      # 让「通过」这件事可复现，而不是靠运气。）
+      - name: Install pinned ruff
+        run: python -m pip install "ruff==0.15.22"
+
+      - name: ruff check
+        run: ruff check --output-format=github .
+
+      - name: ruff format --check
+        run: ruff format --check .
+
+  test:
+    name: pytest ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      # 只有 3.12+ 。本插件的 metadata 声明 astrbot_version ">=4.23,<5"，而
+      # AstrBot 从 v4.14.7 起 requires-python = ">=3.12"，之后每个版本都是。
+      # 3.10/3.11 上这个插件不可能被 AstrBot 加载，测那两个版本只是白占
+      # runner。（本机实测 3.10–3.14 五个版本都能过，见 PR 描述。）
+      # 3.14 在列是因为 AstrBot 自己的 CI 就测 3.14。
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # 运行时零依赖；这三个只是跑测试要用的（README「开发」列的就是
+      # pytest / ruff / PyYAML，ruff 已在 lint job 单独装）。
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip pytest PyYAML
+
+      - name: pytest
+        run: python -m pytest -q
