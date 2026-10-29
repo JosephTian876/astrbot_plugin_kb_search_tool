@@ -86,6 +86,11 @@ def test_is_strictly_under_rejects_sibling_tree(tmp_path):
     assert not is_strictly_under(venv / "astrbot", src)
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="Windows 语义：路径大小写不敏感。POSIX 上把整条路径 .upper() 会变成另一条路径，"
+    "is_strictly_under 判 False 才是对的，这条用例在那里复现不出来",
+)
 def test_is_strictly_under_is_case_insensitive_on_windows(tmp_path):
     """Windows 上 ``d:\\astrbot`` 与 ``D:\\AstrBot`` 是同一个路径，不能判成"不在树下"。"""
     root = tmp_path / "AstrBot" / "backend"
